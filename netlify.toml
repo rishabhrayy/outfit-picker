@@ -1,0 +1,22 @@
+# Deploy settings for Netlify. Netlify auto-detects Vite, but pinning these
+# keeps the deployed build identical to a local one.
+
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+[build.environment]
+  # Vite 8 requires Node ^20.19.0 || >=22.12.0.
+  NODE_VERSION = "22"
+
+# The service worker must never be served from cache, or an installed copy can
+# keep checking a stale worker and miss new deploys.
+[[headers]]
+  for = "/sw.js"
+  [headers.values]
+    Cache-Control = "public, max-age=0, must-revalidate"
+
+[[headers]]
+  for = "/manifest.webmanifest"
+  [headers.values]
+    Cache-Control = "public, max-age=0, must-revalidate"
