@@ -10,6 +10,10 @@ import { detectProvider, getProviderConfig, PROVIDERS } from './providers.js';
 import { normalizeDetectedItem } from '../types.js';
 import { prepareImage } from './image.js';
 
+// Vision calls on a reasoning model routinely take 7-10s; this is the point at
+// which the request is considered hung rather than slow.
+const REQUEST_TIMEOUT_MS = 90_000;
+
 const CATEGORY_ENUM = ['top', 'bottom', 'dress', 'outerwear', 'shoes', 'accessory'];
 const SEASON_ENUM = ['spring', 'summer', 'autumn', 'winter', 'all-season'];
 const WEATHER_ENUM = ['cold', 'cool', 'mild', 'warm', 'hot', 'rainy', 'windy'];
@@ -145,25 +149,47 @@ async function readErrorMessage(response, provider, apiKey) {
     return `${provider.label} no longer offers the model this app requests. The app needs updating.`;
   }
   if (response.status === 429) {
-    return detail.toLowerCase().includes('quota')
-      ? `Your ${provider.label} project is out of credit. Check its billing and usage.`
-      : `${provider.label} is rate-limiting these requests. Wait a moment and try again.`;
+    // A free tier's per-minute rate limit and an exhausted balance both arrive as
+    // 429 and both mention "quota". Telling someone to top up their billing when
+    // they only need to wait a minute sends them somewhere useless, so only claim
+    // a billing problem when the provider actually says so.
+    const lower = detail.toLowerCase();
+    const billing = ['billing', 'insufficient', 'credit', 'plan and billing', 'exceeded your current quota']
+      .some((phrase) => lower.includes(phrase));
+    return billing
+      ? `Your ${provider.label} account is out of credit. Check its billing and usage. (${detail})`
+      : `${provider.label} is rate-limiting these requests — free tiers cap requests per minute. Wait a minute and try again. (${detail})`;
   }
   if (response.status >= 500) {
     return `${provider.label} had a temporary problem. Try again in a moment.`;
   }
 
-  return detail || `${provider.label} returned an error (${response.status}).`;
+  // Always surface the provider's own words. A paraphrase alone makes a
+  // misconfigured key or a disabled API impossible to diagnose from the UI.
+  return detail
+    ? `${provider.label} error ${response.status}: ${detail}`
+    : `${provider.label} returned an error (${response.status}).`;
 }
 
 async function callChatCompletion({ apiKey, provider, model, messages, schema, maxTokens, signal }) {
   const key = requireKey(apiKey, provider);
-  let response;
 
+  // Without a deadline a stalled connection leaves the UI spinning forever, with
+  // no way back except reloading the page.
+  const controller = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, REQUEST_TIMEOUT_MS);
+  const forwardAbort = () => controller.abort();
+  signal?.addEventListener('abort', forwardAbort);
+
+  let response;
   try {
     response = await fetch(`${provider.baseUrl}/chat/completions`, {
       method: 'POST',
-      signal,
+      signal: controller.signal,
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${key}`,
@@ -177,8 +203,14 @@ async function callChatCompletion({ apiKey, provider, model, messages, schema, m
       }),
     });
   } catch (error) {
+    if (timedOut) {
+      throw new Error(`${provider.label} did not respond within ${Math.round(REQUEST_TIMEOUT_MS / 1000)} seconds. Try again.`);
+    }
     if (error?.name === 'AbortError') throw error;
-    throw new Error(`Could not reach ${provider.label}. Check your internet connection and try again.`);
+    throw new Error(`Could not reach ${provider.label}. Check your internet connection, and that the key's API is enabled.`);
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', forwardAbort);
   }
 
   if (!response.ok) {

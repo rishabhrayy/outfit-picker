@@ -12,8 +12,7 @@ import {
   deleteOrphanPhotos,
   getItems,
   getPhotos,
-  saveItems,
-  savePhoto,
+  savePhotoBatches,
   updateItem as updateStoredItem,
 } from './lib/db.js';
 import { prepareImage } from './lib/image.js';
@@ -76,22 +75,31 @@ export async function tagPhoto(file) {
 }
 
 /**
- * Saves the photo once and every reviewed item that points back at it.
+ * Saves one or more photos and every reviewed item that points back at them.
  *
- * The stored photo is the re-encoded JPEG from the tagging step, so a 10 MB
- * HEIC from a phone does not sit in browser storage forever.
+ * Each stored photo is the re-encoded JPEG from the tagging step, so a 10 MB
+ * HEIC off a phone does not sit in browser storage forever. Images are prepared
+ * before the write starts, because the whole batch is written in a single
+ * IndexedDB transaction that must not be interrupted by an await.
  */
-export async function savePhotoItems({ file, sourcePhotoId, items }) {
-  const { blob } = await prepareImage(file);
-  const photo = await savePhoto({
-    id: sourcePhotoId,
-    blob,
-    name: file?.name || '',
-    mimeType: blob.type || 'image/jpeg',
-  });
+export async function savePhotoItems(groups) {
+  const list = Array.isArray(groups) ? groups : [groups];
+  const prepared = await Promise.all(
+    list.map(async ({ file, sourcePhotoId, items }) => {
+      const { blob } = await prepareImage(file);
+      return {
+        blob,
+        photo: { id: sourcePhotoId, blob, name: file?.name || '', mimeType: blob.type || 'image/jpeg' },
+        items: items.map((item) => toStoredItem(item, sourcePhotoId)),
+      };
+    }),
+  );
 
-  const saved = await saveItems(items.map((item) => toStoredItem(item, photo.id)));
-  return saved.map((item) => ({ ...toAppItem(item), photo: blob }));
+  const saved = await savePhotoBatches(prepared);
+
+  return saved.flatMap((batch, index) =>
+    batch.items.map((item) => ({ ...toAppItem(item), photo: prepared[index].blob })),
+  );
 }
 
 export async function updateItem(item) {
@@ -120,10 +128,46 @@ export async function clearWardrobe() {
   await clearAll();
 }
 
+/**
+ * Trims a ranked wardrobe to the shortlist that gets sent for styling.
+ *
+ * A flat slice is wrong here: the ranking breaks ties alphabetically by
+ * category, so "shoes" and "top" sort last and are the first things a plain
+ * top-N drops — exactly the two categories a complete outfit cannot do without.
+ * Taking rank order round-robin across categories keeps every category
+ * represented while still preferring the best-scoring pieces in each.
+ */
+function shortlistCandidates(items, limit) {
+  if (items.length <= limit) return items;
+
+  const byCategory = new Map();
+  items.forEach((item) => {
+    const bucket = byCategory.get(item.category) || [];
+    bucket.push(item);
+    byCategory.set(item.category, bucket);
+  });
+
+  const buckets = [...byCategory.values()];
+  const chosen = new Set();
+  for (let depth = 0; chosen.size < limit; depth += 1) {
+    let addedThisPass = false;
+    for (const bucket of buckets) {
+      if (depth >= bucket.length) continue;
+      chosen.add(bucket[depth].id);
+      addedThisPass = true;
+      if (chosen.size >= limit) break;
+    }
+    if (!addedThisPass) break;
+  }
+
+  // Keep the original ranking order so the strongest pieces are listed first.
+  return items.filter((item) => chosen.has(item.id));
+}
+
 export async function suggestOutfit({ items, preferences = {}, excludedItemIds = [], avoidRecentDays = 7 }) {
   const providerId = getProvider();
   const wantedItemId = preferences.wantedItemId || '';
-  const candidates = makeWardrobePromptItems(items.slice(0, MAX_CANDIDATES), avoidRecentDays);
+  const candidates = makeWardrobePromptItems(shortlistCandidates(items, MAX_CANDIDATES), avoidRecentDays);
 
   return requestOutfit({
     candidates,

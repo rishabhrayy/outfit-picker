@@ -156,6 +156,33 @@ button { -webkit-tap-highlight-color: transparent; }
 .crop-controls input:disabled { opacity: .4; }
 .crop-reset { grid-column: 1 / -1; justify-self: end; font-size: 11px; }
 .crop-reset:disabled { opacity: .4; cursor: default; text-decoration: none; }
+/* Bulk upload: the picked-photo tray and its per-photo tagging status. */
+/* Cold-launch placeholder so a stocked wardrobe never flashes the empty state. */
+.card-skeleton { height: 190px; border-radius: 17px; background: linear-gradient(100deg, #ece8e1 30%, #f5f2ec 50%, #ece8e1 70%); background-size: 220% 100%; animation: card-shimmer 1.3s ease-in-out infinite; }
+@keyframes card-shimmer { from { background-position: 140% 0; } to { background-position: -40% 0; } }
+@media (prefers-reduced-motion: reduce) { .card-skeleton { animation: none; } }
+.toast-region { position: fixed; left: 0; right: 0; bottom: 92px; display: grid; justify-items: center; pointer-events: none; z-index: 40; }
+.item-editor:focus { outline: none; }
+.batch-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(88px, 1fr)); gap: 9px; margin: 14px 0 18px; }
+.batch-tile { position: relative; margin: 0; aspect-ratio: 3 / 4; border-radius: 13px; overflow: hidden; background: #ebe5dc; border: 0; padding: 0; }
+.batch-tile img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.batch-tile.status-tagging img, .batch-tile.status-failed img { opacity: .5; }
+.batch-badge { position: absolute; left: 6px; bottom: 6px; min-width: 20px; height: 20px; display: grid; place-items: center; border-radius: 999px; font-size: 11px; font-weight: 700; color: #fff; }
+.batch-badge.ok { background: #4a7c3f; }
+.batch-badge.bad { background: var(--danger); }
+.batch-badge.working { background: rgba(0,0,0,.55); }
+.batch-remove { position: absolute; top: 5px; right: 5px; width: 22px; height: 22px; border: 0; border-radius: 999px; background: rgba(0,0,0,.6); color: #fff; font-size: 14px; line-height: 1; display: grid; place-items: center; }
+.batch-add { display: grid; place-items: center; gap: 2px; border: 1.5px dashed var(--line); background: var(--canvas); color: var(--muted); }
+.batch-add span { font-size: 22px; }
+.batch-add small { font-size: 10px; }
+.batch-progress { margin: 4px 0 10px; }
+.batch-progress-bar { height: 6px; border-radius: 999px; background: var(--line); overflow: hidden; }
+.batch-progress-bar span { display: block; height: 100%; background: var(--lime-deep); transition: width .3s ease; }
+.batch-progress p { margin: 8px 0 0; font-size: 12px; color: var(--muted); }
+.photo-group { padding: 14px 0 4px; border-top: 1px solid var(--line); margin-top: 16px; }
+.photo-group:first-of-type { border-top: 0; margin-top: 4px; }
+.photo-group .source-photo-row { align-items: center; }
+.photo-group .review-list { margin-top: 10px; }
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 11px; }
 .review-fields { margin-top: 10px; }
 .form-grid label, .wanted-select, .key-field { display: grid; gap: 6px; color: #615b55; font-size: 11px; font-weight: 750; letter-spacing: .025em; }
@@ -234,7 +261,7 @@ button { -webkit-tap-highlight-color: transparent; }
 .last-worn-row { display: flex; justify-content: space-between; align-items: center; border-top: 1px solid var(--line); padding-top: 10px; color: var(--muted); font-size: 12px; }
 .last-worn-row strong { color: var(--ink); font-size: 12px; }
 .danger-text-button { display: block; margin: 17px auto 0; color: var(--danger); border: 0; background: transparent; cursor: pointer; font-size: 12px; text-decoration: underline; text-underline-offset: 3px; }
-.toast { position: fixed; z-index: 80; left: 50%; bottom: 85px; transform: translateX(-50%); width: max-content; max-width: calc(100% - 34px); color: white; background: rgba(37,35,33,.93); padding: 11px 14px; border-radius: 13px; box-shadow: 0 8px 25px rgba(0,0,0,.18); font-size: 12px; text-align: center; animation: toast-in .25s ease both; }
+.toast { position: relative; width: max-content; max-width: calc(100% - 34px); color: white; background: rgba(37,35,33,.93); padding: 11px 14px; border-radius: 13px; box-shadow: 0 8px 25px rgba(0,0,0,.18); font-size: 12px; text-align: center; animation: toast-in .25s ease both; }
 @keyframes toast-in { from { opacity: 0; transform: translate(-50%, 9px); } to { opacity: 1; transform: translate(-50%, 0); } }
 
 @media (min-width: 620px) {

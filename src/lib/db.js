@@ -210,6 +210,49 @@ export async function saveItems(values) {
 }
 
 /**
+ * Saves several photos and all of their items in one atomic transaction.
+ *
+ * Used by bulk upload: either the whole batch lands or none of it does, so a
+ * failure part-way through cannot leave items pointing at a missing photo.
+ *
+ * Every record is normalized BEFORE the transaction opens, and every put is
+ * issued in the same tick. An await inside an IndexedDB transaction lets it
+ * auto-commit, which would silently drop the remaining writes.
+ */
+export async function savePhotoBatches(batches) {
+  if (!Array.isArray(batches)) {
+    throw new Error('savePhotoBatches expects an array of { photo, items } batches.');
+  }
+
+  const now = new Date();
+  const prepared = batches.map(({ photo, items }) => {
+    const photoRecord = normalizePhotoRecord(photo, { now });
+    if (!isBlobLike(photoRecord.blob)) {
+      throw new Error('Every batch needs a photo with a Blob before it can be saved.');
+    }
+
+    return {
+      photo: photoRecord,
+      items: (items || []).map((item) => normalizeSavedItem({ ...item, sourcePhotoId: photoRecord.id }, now)),
+    };
+  });
+
+  return withTransaction([PHOTO_STORE, ITEM_STORE], 'readwrite', async (transaction) => {
+    const photoStore = transaction.objectStore(PHOTO_STORE);
+    const itemStore = transaction.objectStore(ITEM_STORE);
+    const writes = [];
+
+    prepared.forEach(({ photo, items }) => {
+      writes.push(requestToPromise(photoStore.put(photo)));
+      items.forEach((item) => writes.push(requestToPromise(itemStore.put(item))));
+    });
+
+    await Promise.all(writes);
+    return prepared;
+  });
+}
+
+/**
  * Gets all stored wardrobe items, newest first. Pass { category } to filter locally.
  */
 export async function getItems({ category } = {}) {

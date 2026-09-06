@@ -43,6 +43,10 @@ const WEATHER_OPTIONS = [
 // this list is dropped on save. Style tags are the place for free-form words.
 const SEASON_HINT = 'Recognised: spring, summer, autumn, winter, all-season, cold, cool, mild, warm, hot, rainy, windy';
 
+// Each photo costs one vision call and one decode, so a batch is bounded to keep
+// tagging time and peak memory predictable on a phone.
+const MAX_BATCH_PHOTOS = 20;
+
 function uid() {
   return globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
@@ -210,6 +214,9 @@ function CropControls({ crop, onChange, idPrefix }) {
  */
 export default function App({ services = EMPTY_SERVICES, initialItems = [], reloadKey = 0 }) {
   const [items, setItems] = useState(() => initialItems.map(normalizeItem));
+  // Reading a wardrobe out of IndexedDB is async, so without this the empty
+  // state flashes on every cold launch and tells a stocked wardrobe it is empty.
+  const [isLoading, setIsLoading] = useState(() => Boolean(services.listItems));
   const [activeTab, setActiveTab] = useState('wardrobe');
   const [editingItem, setEditingItem] = useState(null);
   const [toast, setToast] = useState('');
@@ -222,20 +229,28 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
       .then((loaded) => {
         if (isCurrent) setItems((loaded || []).map(normalizeItem));
       })
-      .catch(() => {
-        if (isCurrent) setToast('Your wardrobe could not be loaded right now.');
+      .catch((error) => {
+        if (isCurrent) setToast(error?.message || 'Your wardrobe could not be loaded right now.');
+      })
+      .finally(() => {
+        if (isCurrent) setIsLoading(false);
       });
     return () => { isCurrent = false; };
   }, [services, reloadKey]);
 
+  // One object URL per PHOTO, not per item: a full-outfit shot backs several
+  // items, and a bulk upload multiplies that. Keying by photo also means editing
+  // one item no longer revokes and remints every URL in the wardrobe.
   useEffect(() => {
     const created = {};
+    const byPhoto = {};
     items.forEach((item) => {
-      if (!item.imageUrl && item.photo instanceof Blob) {
-        created[item.id] = URL.createObjectURL(item.photo);
-      }
+      if (item.imageUrl || !(item.photo instanceof Blob)) return;
+      const photoKey = item.sourcePhotoId || item.id;
+      if (!created[photoKey]) created[photoKey] = URL.createObjectURL(item.photo);
+      byPhoto[item.id] = created[photoKey];
     });
-    setBlobUrls(created);
+    setBlobUrls(byPhoto);
     return () => Object.values(created).forEach((url) => URL.revokeObjectURL(url));
   }, [items]);
 
@@ -270,15 +285,28 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
     }
   };
 
-  const saveBatch = async ({ file, sourcePhotoId, reviewedItems }) => {
-    const prepared = reviewedItems.map((item) => normalizeItem({ ...item, sourcePhotoId, photo: file }));
+  /**
+   * Takes one group per source photo, so a bulk upload lands as a single
+   * all-or-nothing write rather than a photo at a time.
+   */
+  const saveBatch = async (groups) => {
+    const list = Array.isArray(groups) ? groups : [groups];
+    const prepared = list.map(({ file, sourcePhotoId, reviewedItems }) => ({
+      file,
+      sourcePhotoId,
+      items: reviewedItems.map((item) => normalizeItem({ ...item, sourcePhotoId, photo: file })),
+    }));
+    const flat = prepared.flatMap((group) => group.items);
+
     try {
-      const stored = services.savePhotoItems
-        ? await services.savePhotoItems({ file, sourcePhotoId, items: prepared })
-        : prepared;
-      const normalized = (stored || prepared).map(normalizeItem);
+      const stored = services.savePhotoItems ? await services.savePhotoItems(prepared) : flat;
+      const normalized = (stored || flat).map(normalizeItem);
+      const photoCount = prepared.length;
       setItems((current) => [...normalized, ...current]);
-      setToast(`${normalized.length} ${normalized.length === 1 ? 'item' : 'items'} added to your wardrobe.`);
+      setToast(
+        `${normalized.length} ${normalized.length === 1 ? 'item' : 'items'} added`
+        + `${photoCount > 1 ? ` from ${photoCount} photos` : ''}.`,
+      );
       setActiveTab('wardrobe');
       return normalized;
     } catch (error) {
@@ -313,6 +341,7 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
       <main className="app-content">
         {activeTab === 'wardrobe' && (
           <WardrobeView
+            isLoading={isLoading}
             items={items}
             blobUrls={blobUrls}
             onOpenItem={setEditingItem}
@@ -363,7 +392,9 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
           onDelete={deleteItem}
         />
       )}
-      {toast && <div className="toast" role="status">{toast}</div>}
+      <div className="toast-region" role="status" aria-live="polite">
+        {toast && <div className="toast">{toast}</div>}
+      </div>
     </div>
   );
 }
@@ -377,7 +408,7 @@ function NavButton({ icon, label, active, onClick }) {
   );
 }
 
-function WardrobeView({ items, blobUrls, onOpenItem, onAdd, onSuggest }) {
+function WardrobeView({ items, blobUrls, onOpenItem, onAdd, onSuggest, isLoading }) {
   const [filter, setFilter] = useState('all');
   const filteredItems = useMemo(
     () => (filter === 'all' ? items : items.filter((item) => item.category === filter)),
@@ -415,7 +446,11 @@ function WardrobeView({ items, blobUrls, onOpenItem, onAdd, onSuggest }) {
         ))}
       </div>
 
-      {filteredItems.length ? (
+      {isLoading ? (
+        <div className="wardrobe-grid" aria-hidden="true">
+          {Array.from({ length: 4 }, (unused, index) => <div className="card-skeleton" key={index} />)}
+        </div>
+      ) : filteredItems.length ? (
         <div className="wardrobe-grid">
           {filteredItems.map((item) => (
             <button className="wardrobe-card" type="button" key={item.id} onClick={() => onOpenItem(item)}>
@@ -461,111 +496,227 @@ function EmptyWardrobe({ filter, onAdd }) {
 
 function UploadView({ tagPhoto, onSaveBatch, onCancel, onToast }) {
   const inputRef = useRef(null);
-  const [file, setFile] = useState(null);
-  const [preview, setPreview] = useState('');
-  const [reviewItems, setReviewItems] = useState([]);
-  const [selectedForMerge, setSelectedForMerge] = useState([]);
-  const [isTagging, setIsTagging] = useState(false);
+  // One entry per picked photo. Each carries its own preview URL, tagging status
+  // and detected items, so one failure never blocks the rest of the batch.
+  const [entries, setEntries] = useState([]);
+  const [stage, setStage] = useState('pick');
+  const [progress, setProgress] = useState({ done: 0, total: 0 });
   const [isSaving, setIsSaving] = useState(false);
   const [taggingNote, setTaggingNote] = useState('');
+  const [mergeSelection, setMergeSelection] = useState([]);
 
-  useEffect(() => () => { if (preview) URL.revokeObjectURL(preview); }, [preview]);
+  // Preview URLs are owned by this component for the life of the batch.
+  const entriesRef = useRef(entries);
+  entriesRef.current = entries;
+  useEffect(() => () => {
+    entriesRef.current.forEach((entry) => URL.revokeObjectURL(entry.previewUrl));
+  }, []);
 
   const reset = () => {
-    setFile(null);
-    setPreview('');
-    setReviewItems([]);
-    setSelectedForMerge([]);
+    entries.forEach((entry) => URL.revokeObjectURL(entry.previewUrl));
+    setEntries([]);
+    setStage('pick');
+    setProgress({ done: 0, total: 0 });
     setTaggingNote('');
+    setMergeSelection([]);
     if (inputRef.current) inputRef.current.value = '';
   };
 
-  const selectFile = (event) => {
-    const nextFile = event.target.files?.[0];
-    if (!nextFile) return;
-    if (!nextFile.type.startsWith('image/')) {
-      onToast('Please choose an image file.');
+  const addFiles = (event) => {
+    const picked = [...(event.target.files || [])];
+    if (inputRef.current) inputRef.current.value = '';
+    if (!picked.length) return;
+
+    const images = picked.filter((file) => file.type.startsWith('image/'));
+    const skipped = picked.length - images.length;
+    const room = MAX_BATCH_PHOTOS - entries.length;
+    const accepted = images.slice(0, Math.max(0, room));
+    const overflow = images.length - accepted.length;
+
+    if (!accepted.length) {
+      onToast(room <= 0 ? `That is the ${MAX_BATCH_PHOTOS}-photo limit for one batch.` : 'Please choose image files.');
       return;
     }
-    setFile(nextFile);
-    setPreview(URL.createObjectURL(nextFile));
-    setReviewItems([]);
-    setSelectedForMerge([]);
-    setTaggingNote('');
+
+    setEntries((current) => [
+      ...current,
+      ...accepted.map((file) => ({
+        id: uid(),
+        file,
+        previewUrl: URL.createObjectURL(file),
+        status: 'pending',
+        error: '',
+        items: [],
+      })),
+    ]);
+    setStage('ready');
+
+    const notes = [];
+    if (skipped) notes.push(`${skipped} non-image ${skipped === 1 ? 'file was' : 'files were'} skipped`);
+    if (overflow) notes.push(`${overflow} over the ${MAX_BATCH_PHOTOS}-photo limit ${overflow === 1 ? 'was' : 'were'} left out`);
+    if (notes.length) onToast(`${notes.join(', ')}.`);
   };
 
-  const setDetectedItems = (detected) => {
-    const normalized = (detected || []).map((item) => normalizeItem({ ...item, id: uid(), sourcePhotoId: 'pending' }));
-    setReviewItems(normalized.length ? normalized : [normalizeItem({ id: uid(), sourcePhotoId: 'pending' })]);
-  };
-
-  const analysePhoto = async () => {
-    if (!file) return;
-    setIsTagging(true);
-    setTaggingNote('Looking at every wearable piece in the photo…');
-    try {
-      if (!tagPhoto) {
-        setDetectedItems([{
-          category: 'top',
-          colors: [],
-          styleTags: [],
-          seasons: [],
-          notes: '',
-        }]);
-        setTaggingNote('Add an API key in Settings to auto-tag. You can still add this piece manually.');
-        return;
+  const removeEntry = (id) => {
+    setEntries((current) => {
+      const target = current.find((entry) => entry.id === id);
+      if (target) URL.revokeObjectURL(target.previewUrl);
+      const next = current.filter((entry) => entry.id !== id);
+      if (!next.length) {
+        setStage('pick');
+        setTaggingNote('');
       }
-      const response = await tagPhoto(file);
-      const detected = Array.isArray(response) ? response : response?.items;
-      setDetectedItems(detected);
-      setTaggingNote(response?.model ? `Tagged with ${response.model}. Review the details below.` : 'We found these pieces. Review before saving.');
-    } catch (error) {
-      setDetectedItems([]);
-      setTaggingNote(error?.message || 'Auto-tagging did not finish. Add the item details manually below.');
-    } finally {
-      setIsTagging(false);
+      return next;
+    });
+    setMergeSelection((current) => current.filter((entry) => !entry.startsWith(id)));
+  };
+
+  const patchEntry = (id, changes) => {
+    setEntries((current) => current.map((entry) => (entry.id === id ? { ...entry, ...changes } : entry)));
+  };
+
+  const blankItem = () => normalizeItem({ id: uid(), sourcePhotoId: 'pending', category: 'top' });
+
+  /**
+   * Tags photos one at a time. Free API tiers rate-limit aggressively, and a
+   * burst of parallel vision calls is the fastest way to trip that, so this
+   * trades wall-clock for reliability and shows progress instead.
+   */
+  const analyseAll = async () => {
+    const queue = entries.filter((entry) => entry.status === 'pending' || entry.status === 'failed');
+    if (!queue.length) return;
+
+    setStage('tagging');
+    setProgress({ done: 0, total: queue.length });
+    setTaggingNote('');
+
+    let failures = 0;
+    let detected = 0;
+
+    for (let index = 0; index < queue.length; index += 1) {
+      const entry = queue[index];
+      patchEntry(entry.id, { status: 'tagging', error: '' });
+
+      try {
+        if (!tagPhoto) throw new Error('Add an API key in Settings to auto-tag.');
+        const response = await tagPhoto(entry.file);
+        const found = (Array.isArray(response) ? response : response?.items) || [];
+        const items = found.map((item) => normalizeItem({ ...item, id: uid(), sourcePhotoId: 'pending' }));
+        detected += items.length;
+        patchEntry(entry.id, {
+          status: 'done',
+          model: response?.model || '',
+          items: items.length ? items : [blankItem()],
+          note: items.length ? '' : 'Nothing wearable was found here. Add it by hand or remove the photo.',
+        });
+      } catch (error) {
+        failures += 1;
+        patchEntry(entry.id, {
+          status: 'failed',
+          error: error?.message || 'Tagging failed for this photo.',
+          items: [blankItem()],
+        });
+      }
+
+      setProgress({ done: index + 1, total: queue.length });
     }
+
+    setStage('review');
+    setTaggingNote(
+      failures
+        ? `${detected} ${detected === 1 ? 'piece' : 'pieces'} found. ${failures} ${failures === 1 ? 'photo' : 'photos'} could not be tagged — fill those in by hand below, or remove them.`
+        : `${detected} ${detected === 1 ? 'piece' : 'pieces'} found across ${queue.length} ${queue.length === 1 ? 'photo' : 'photos'}. Review before saving.`,
+    );
   };
 
-  const patchReviewItem = (id, changes) => {
-    setReviewItems((current) => current.map((item) => (item.id === id ? { ...item, ...changes } : item)));
+  const tagManually = () => {
+    setEntries((current) => current.map((entry) => ({
+      ...entry,
+      status: 'done',
+      items: entry.items.length ? entry.items : [blankItem()],
+    })));
+    setStage('review');
+    setTaggingNote('Add the details for each piece, then save.');
   };
 
-  const addReviewItem = () => {
-    setReviewItems((current) => [...current, normalizeItem({ id: uid(), sourcePhotoId: 'pending', category: 'top' })]);
+  const patchItem = (entryId, itemId, changes) => {
+    setEntries((current) => current.map((entry) => (
+      entry.id === entryId
+        ? { ...entry, items: entry.items.map((item) => (item.id === itemId ? { ...item, ...changes } : item)) }
+        : entry
+    )));
   };
 
-  const toggleMerge = (id) => {
-    setSelectedForMerge((current) => current.includes(id) ? current.filter((entry) => entry !== id) : [...current, id]);
+  const addItem = (entryId) => {
+    setEntries((current) => current.map((entry) => (
+      entry.id === entryId ? { ...entry, items: [...entry.items, blankItem()] } : entry
+    )));
   };
+
+  const removeItem = (entryId, itemId) => {
+    setEntries((current) => current.map((entry) => (
+      entry.id === entryId ? { ...entry, items: entry.items.filter((item) => item.id !== itemId) } : entry
+    )));
+    setMergeSelection((current) => current.filter((key) => key !== `${entryId}:${itemId}`));
+  };
+
+  // Merging only ever happens within one photo, because merged pieces must still
+  // point at a single source image.
+  const toggleMerge = (entryId, itemId) => {
+    const key = `${entryId}:${itemId}`;
+    setMergeSelection((current) => (
+      current.includes(key) ? current.filter((entry) => entry !== key) : [...current, key]
+    ));
+  };
+
+  const mergeableEntryId = (() => {
+    if (mergeSelection.length < 2) return null;
+    const owners = new Set(mergeSelection.map((key) => key.split(':')[0]));
+    return owners.size === 1 ? [...owners][0] : null;
+  })();
 
   const mergeSelected = () => {
-    if (selectedForMerge.length < 2) return;
-    const selected = reviewItems.filter((item) => selectedForMerge.includes(item.id));
-    const keeper = selected[0];
-    const merged = {
-      ...keeper,
-      colors: [...new Set(selected.flatMap((item) => item.colors))],
-      styleTags: [...new Set(selected.flatMap((item) => item.styleTags))],
-      seasons: [...new Set(selected.flatMap((item) => item.seasons))],
-      notes: selected.map((item) => item.notes).filter(Boolean).join(' '),
-    };
-    setReviewItems((current) => current.filter((item) => !selectedForMerge.includes(item.id) || item.id === keeper.id).map((item) => item.id === keeper.id ? merged : item));
-    setSelectedForMerge([]);
+    if (!mergeableEntryId) return;
+    const chosen = new Set(mergeSelection.map((key) => key.split(':')[1]));
+    setEntries((current) => current.map((entry) => {
+      if (entry.id !== mergeableEntryId) return entry;
+      const selected = entry.items.filter((item) => chosen.has(item.id));
+      if (selected.length < 2) return entry;
+      const keeper = {
+        ...selected[0],
+        colors: [...new Set(selected.flatMap((item) => item.colors))],
+        styleTags: [...new Set(selected.flatMap((item) => item.styleTags))],
+        seasons: [...new Set(selected.flatMap((item) => item.seasons))],
+        notes: selected.map((item) => item.notes).filter(Boolean).join(' '),
+      };
+      return {
+        ...entry,
+        items: entry.items
+          .filter((item) => !chosen.has(item.id) || item.id === keeper.id)
+          .map((item) => (item.id === keeper.id ? keeper : item)),
+      };
+    }));
+    setMergeSelection([]);
   };
 
+  const totalItems = entries.reduce((count, entry) => count + entry.items.length, 0);
+
   const save = async () => {
-    if (!file || !reviewItems.length) return;
+    const groups = entries
+      .filter((entry) => entry.items.length)
+      .map((entry) => ({ file: entry.file, sourcePhotoId: uid(), reviewedItems: entry.items }));
+    if (!groups.length) return;
+
     setIsSaving(true);
     try {
-      await onSaveBatch({ file, sourcePhotoId: uid(), reviewedItems: reviewItems });
+      await onSaveBatch(groups);
       reset();
     } finally {
       setIsSaving(false);
     }
   };
 
-  if (!file) {
+  if (stage === 'pick') {
     return (
       <section className="screen upload-screen">
         <div className="screen-heading">
@@ -573,33 +724,67 @@ function UploadView({ tagPhoto, onSaveBatch, onCancel, onToast }) {
         </div>
         <div className="upload-dropzone">
           <div className="camera-orb">◉</div>
-          <h2>Choose a photo</h2>
-          <p>Single pieces, mirror selfies, and whole outfits all work. We’ll find the wearable items, not the background.</p>
-          <button className="primary-button" type="button" onClick={() => inputRef.current?.click()}>Choose a photo <span>→</span></button>
-          <small>JPG, PNG, HEIC and other image formats</small>
+          <h2>Choose your photos</h2>
+          <p>Pick one or many. Single pieces, mirror selfies, and whole outfits all work. We’ll find the wearable items, not the background.</p>
+          <button className="primary-button" type="button" onClick={() => inputRef.current?.click()}>Choose photos <span>→</span></button>
+          <small>Up to {MAX_BATCH_PHOTOS} at a time · JPG, PNG, HEIC and more</small>
         </div>
         <div className="tip-card"><span>✦</span><p><strong>Tip:</strong> Natural photos are perfect. You don’t need product shots or a plain background.</p></div>
-        <input ref={inputRef} className="visually-hidden" type="file" accept="image/*" onChange={selectFile} />
+        <input ref={inputRef} className="visually-hidden" type="file" accept="image/*" multiple onChange={addFiles} />
       </section>
     );
   }
 
-  if (!reviewItems.length) {
+  if (stage === 'ready' || stage === 'tagging') {
+    const busy = stage === 'tagging';
     return (
       <section className="screen upload-screen">
-        <button className="text-button back-button" type="button" onClick={reset}>← Choose another photo</button>
-        <div className="selected-upload-preview"><img src={preview} alt="Selected clothing upload" /></div>
-        <div className="upload-analysis-copy">
-          <p className="eyebrow">PHOTO READY</p>
-          <h1>Let’s find the pieces</h1>
-          <p>We’ll look for every distinct wearable item in this image, then you can correct anything before it’s saved.</p>
+        <div className="review-header">
+          <div>
+            <p className="eyebrow">PHOTOS READY</p>
+            <h1>{entries.length} {entries.length === 1 ? 'photo' : 'photos'}</h1>
+          </div>
+          {!busy && <button className="text-button" type="button" onClick={reset}>Start over</button>}
         </div>
-        <button className="primary-button full-width" type="button" disabled={isTagging} onClick={analysePhoto}>
-          {isTagging ? <><span className="button-spinner" /> Analysing photo…</> : <>Auto-tag this photo <span>✦</span></>}
-        </button>
-        {taggingNote && <p className="inline-note">{taggingNote}</p>}
-        <button className="secondary-button full-width" type="button" onClick={() => setDetectedItems([])}>Tag it myself</button>
-        <button className="text-button centered" type="button" onClick={onCancel}>Cancel</button>
+        <p className="review-description">Every wearable item in each photo becomes its own wardrobe piece. You review everything before it saves.</p>
+
+        <div className="batch-grid">
+          {entries.map((entry) => (
+            <figure className={`batch-tile status-${entry.status}`} key={entry.id}>
+              <img src={entry.previewUrl} alt="" />
+              {entry.status === 'tagging' && <span className="batch-badge working"><span className="button-spinner dark" /></span>}
+              {entry.status === 'done' && <span className="batch-badge ok">✓</span>}
+              {entry.status === 'failed' && <span className="batch-badge bad">!</span>}
+              {!busy && (
+                <button className="batch-remove" type="button" aria-label="Remove this photo" onClick={() => removeEntry(entry.id)}>×</button>
+              )}
+            </figure>
+          ))}
+          {!busy && entries.length < MAX_BATCH_PHOTOS && (
+            <button className="batch-tile batch-add" type="button" onClick={() => inputRef.current?.click()}>
+              <span>＋</span><small>Add more</small>
+            </button>
+          )}
+        </div>
+
+        {busy ? (
+          <>
+            <div className="batch-progress" role="status" aria-live="polite">
+              <div className="batch-progress-bar"><span style={{ width: `${progress.total ? (progress.done / progress.total) * 100 : 0}%` }} /></div>
+              <p>Tagging photo {Math.min(progress.done + 1, progress.total)} of {progress.total}…</p>
+            </div>
+            <p className="inline-note">One at a time, so a free API tier doesn’t rate-limit the batch.</p>
+          </>
+        ) : (
+          <>
+            <button className="primary-button full-width" type="button" onClick={analyseAll}>
+              Auto-tag {entries.length === 1 ? 'this photo' : `all ${entries.length} photos`} <span>✦</span>
+            </button>
+            <button className="secondary-button full-width" type="button" onClick={tagManually}>Tag them myself</button>
+            <button className="text-button centered" type="button" onClick={onCancel}>Cancel</button>
+          </>
+        )}
+        <input ref={inputRef} className="visually-hidden" type="file" accept="image/*" multiple onChange={addFiles} />
       </section>
     );
   }
@@ -607,42 +792,56 @@ function UploadView({ tagPhoto, onSaveBatch, onCancel, onToast }) {
   return (
     <section className="screen upload-screen review-screen">
       <div className="review-header">
-        <div><p className="eyebrow">REVIEW DETECTION</p><h1>{reviewItems.length} {reviewItems.length === 1 ? 'piece found' : 'pieces found'}</h1></div>
+        <div>
+          <p className="eyebrow">REVIEW DETECTION</p>
+          <h1>{totalItems} {totalItems === 1 ? 'piece' : 'pieces'} from {entries.length} {entries.length === 1 ? 'photo' : 'photos'}</h1>
+        </div>
         <button className="text-button" type="button" onClick={reset}>Start over</button>
       </div>
-      <p className="review-description">Each card becomes its own wardrobe item. Adjust the labels, add a missed piece, or merge anything that should be one item.</p>
       {taggingNote && <p className="inline-note">{taggingNote}</p>}
 
-      <div className="source-photo-row">
-        <img src={preview} alt="Source outfit" />
-        <span><strong>1 source photo</strong><small>All pieces link back to this photo</small></span>
-      </div>
+      {mergeSelection.length >= 2 && (
+        <div className="review-actions">
+          <button className="secondary-button compact" type="button" disabled={!mergeableEntryId} onClick={mergeSelected}>
+            Merge selected ({mergeSelection.length})
+          </button>
+          {!mergeableEntryId && <p className="inline-note">Pieces can only merge within the same photo.</p>}
+        </div>
+      )}
 
-      <div className="review-actions">
-        <button className="secondary-button compact" type="button" onClick={addReviewItem}>＋ Split / add a piece</button>
-        <button className="secondary-button compact" type="button" disabled={selectedForMerge.length < 2} onClick={mergeSelected}>Merge selected ({selectedForMerge.length})</button>
-      </div>
+      {entries.map((entry, entryIndex) => (
+        <div className="photo-group" key={entry.id}>
+          <div className="source-photo-row">
+            <img src={entry.previewUrl} alt="" />
+            <span>
+              <strong>Photo {entryIndex + 1}</strong>
+              <small>{entry.items.length} {entry.items.length === 1 ? 'piece' : 'pieces'} · all link back to this photo</small>
+            </span>
+            <button className="icon-text-button danger-text" type="button" onClick={() => removeEntry(entry.id)}>Remove</button>
+          </div>
+          {entry.error && <p className="key-warning" role="alert">{entry.error}</p>}
+          {entry.note && <p className="inline-note">{entry.note}</p>}
 
-      <div className="review-list">
-        {reviewItems.map((item, index) => (
-          <ReviewItemCard
-            key={item.id}
-            item={item}
-            index={index}
-            preview={preview}
-            selected={selectedForMerge.includes(item.id)}
-            onToggleMerge={() => toggleMerge(item.id)}
-            onChange={(changes) => patchReviewItem(item.id, changes)}
-            onRemove={() => {
-              setReviewItems((current) => current.filter((entry) => entry.id !== item.id));
-              setSelectedForMerge((current) => current.filter((entry) => entry !== item.id));
-            }}
-          />
-        ))}
-      </div>
+          <div className="review-list">
+            {entry.items.map((item, index) => (
+              <ReviewItemCard
+                key={item.id}
+                item={item}
+                index={index}
+                preview={entry.previewUrl}
+                selected={mergeSelection.includes(`${entry.id}:${item.id}`)}
+                onToggleMerge={() => toggleMerge(entry.id, item.id)}
+                onChange={(changes) => patchItem(entry.id, item.id, changes)}
+                onRemove={() => removeItem(entry.id, item.id)}
+              />
+            ))}
+          </div>
+          <button className="secondary-button compact" type="button" onClick={() => addItem(entry.id)}>＋ Split / add a piece</button>
+        </div>
+      ))}
 
-      <button className="primary-button full-width save-batch-button" type="button" disabled={isSaving || !reviewItems.length} onClick={save}>
-        {isSaving ? <><span className="button-spinner" /> Saving…</> : <>Save {reviewItems.length} to wardrobe <span>→</span></>}
+      <button className="primary-button full-width save-batch-button" type="button" disabled={isSaving || !totalItems} onClick={save}>
+        {isSaving ? <><span className="button-spinner" /> Saving…</> : <>Save {totalItems} to wardrobe <span>→</span></>}
       </button>
       <button className="text-button centered" type="button" onClick={onCancel}>Cancel without saving</button>
     </section>
@@ -864,7 +1063,44 @@ function SettingsView({ onClear, onToast }) {
 function ItemEditor({ item, blobUrls, onClose, onSave, onDelete }) {
   const [draft, setDraft] = useState(() => normalizeItem(item));
   const [isSaving, setIsSaving] = useState(false);
+  const dialogRef = useRef(null);
   useEffect(() => setDraft(normalizeItem(item)), [item]);
+
+  // A modal that cannot be dismissed from the keyboard, and that drops focus
+  // back to the top of the page on close, is unusable without a mouse.
+  useEffect(() => {
+    const opener = document.activeElement;
+    dialogRef.current?.focus();
+
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape') {
+        event.stopPropagation();
+        onClose();
+        return;
+      }
+      if (event.key !== 'Tab') return;
+
+      const focusable = dialogRef.current?.querySelectorAll(
+        'button:not([disabled]), input:not([disabled]), select, textarea, [href]',
+      );
+      if (!focusable?.length) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+
+    document.addEventListener('keydown', onKeyDown, true);
+    return () => {
+      document.removeEventListener('keydown', onKeyDown, true);
+      if (opener instanceof HTMLElement) opener.focus();
+    };
+  }, [onClose]);
   const update = (changes) => setDraft((current) => ({ ...current, ...changes }));
   const updateList = (key, value) => update({ [key]: asList(value) });
   const save = async () => {
@@ -879,7 +1115,7 @@ function ItemEditor({ item, blobUrls, onClose, onSave, onDelete }) {
 
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-      <section className="item-editor" role="dialog" aria-modal="true" aria-labelledby="editor-title">
+      <section className="item-editor" role="dialog" aria-modal="true" aria-labelledby="editor-title" ref={dialogRef} tabIndex={-1}>
         <div className="modal-handle" />
         <div className="editor-header"><div><p className="eyebrow">EDIT PIECE</p><h2 id="editor-title">Make it yours</h2></div><button className="close-button" type="button" onClick={onClose} aria-label="Close editor">×</button></div>
         <Photo item={draft} blobUrls={blobUrls} className="editor-photo" alt={`${displayCategory(draft.category)} item`} />
