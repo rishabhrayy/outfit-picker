@@ -1,0 +1,36 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+dist-ssr/
+*.local
+
+# Editor and OS noise
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local scratch folders
+outputs/
+work/
+
+# Never commit a key. This app stores keys in the browser's localStorage,
+# so nothing here should ever hold one, but this is a cheap safety net.
+.env
+.env.*
+!.env.example
