@@ -75,3 +75,39 @@ export function cropStyle(crop) {
 
   return { transform: `scale(${zoom})`, transformOrigin: `${x}% ${y}%` };
 }
+
+/**
+ * Position for a highlight box drawn OVER the full, unzoomed source photo —
+ * the opposite move from cropStyle, which zooms into just the item and hides
+ * the rest of the photo. This is what shows an item in the context of the
+ * whole outfit it was photographed in: the crop rect is already stored as a
+ * percentage box, so this reads it directly instead of converting through
+ * zoom/pan controls.
+ *
+ * Returns null when there is no meaningful crop (the item uses the whole
+ * photo), in which case nothing needs highlighting.
+ */
+export function spotlightStyle(crop) {
+  const width = Number(crop?.width);
+  const height = Number(crop?.height);
+  if (!crop || crop.unit !== 'percent' || !Number.isFinite(width) || !Number.isFinite(height)) {
+    return null;
+  }
+  if (width >= 99.5 && height >= 99.5) {
+    // Effectively the full photo — a highlight box here would just outline
+    // the whole image, which tells the viewer nothing.
+    return null;
+  }
+
+  const x = clamp(Number(crop.x) || 0, 0, 100);
+  const y = clamp(Number(crop.y) || 0, 0, 100);
+  const safeWidth = clamp(width, 1, 100 - x);
+  const safeHeight = clamp(height, 1, 100 - y);
+
+  return {
+    top: `${y}%`,
+    left: `${x}%`,
+    width: `${safeWidth}%`,
+    height: `${safeHeight}%`,
+  };
+}

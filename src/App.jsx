@@ -5,8 +5,15 @@ import {
   controlsFromCrop,
   cropFromControls,
   cropStyle,
+  spotlightStyle,
 } from './lib/crop.js';
-import { filterWardrobeForOutfit, missingForCompleteOutfit, occasionKey } from './lib/outfit.js';
+import {
+  computeWardrobeStats,
+  filterWardrobeForOutfit,
+  missingForCompleteOutfit,
+  occasionKey,
+  shuffleOutfit,
+} from './lib/outfit.js';
 import { DEFAULT_PRESET_ID, PROVIDER_PRESETS, detectPresetFromKey, getPreset } from './lib/providers.js';
 import { testProvider } from './lib/ai.js';
 import {
@@ -44,7 +51,9 @@ const WEATHER_OPTIONS = [
 
 // Season and weather are stored as a controlled vocabulary, so anything outside
 // this list is dropped on save. Style tags are the place for free-form words.
-const SEASON_HINT = 'Recognised: spring, summer, autumn, winter, all-season, cold, cool, mild, warm, hot, rainy, windy';
+// Shared by the item editor's hint text and bulk-edit's "set season" action.
+const SEASON_WEATHER_VALUES = ['spring', 'summer', 'autumn', 'winter', 'all-season', 'cold', 'cool', 'mild', 'warm', 'hot', 'rainy', 'windy'];
+const SEASON_HINT = `Recognised: ${SEASON_WEATHER_VALUES.join(', ')}`;
 
 // Each photo costs one vision call and one decode, so a batch is bounded to keep
 // tagging time and peak memory predictable on a phone.
@@ -72,7 +81,26 @@ function normalizeItem(item = {}) {
     seasons: asList(item.seasons || item.season || item.weatherSuitability || item.weather_suitability),
     notes: item.notes || '',
     lastWornDate: item.lastWornDate || item.last_worn_date || '',
+    pricePaid: Number(item.pricePaid) > 0 ? Number(item.pricePaid) : null,
     crop: item.crop || null,
+  };
+}
+
+/**
+ * A date plus the items worn or planned for it. Local re-normalizer, same
+ * reasoning as normalizeItem above: the UI shouldn't trust the storage
+ * layer's exact shape, and this keeps every outfit-record field a defined,
+ * predictable type no matter where the record came from.
+ */
+function normalizeOutfitEntry(record = {}) {
+  return {
+    id: record.id || uid(),
+    date: record.date || localDate(),
+    itemIds: Array.isArray(record.itemIds) ? record.itemIds.filter(Boolean) : [],
+    status: record.status === 'planned' ? 'planned' : 'worn',
+    source: record.source || 'manual',
+    explanation: record.explanation || '',
+    occasion: record.occasion || '',
   };
 }
 
@@ -84,6 +112,10 @@ function localDate() {
   const now = new Date();
   const offset = now.getTimezoneOffset() * 60_000;
   return new Date(now.getTime() - offset).toISOString().slice(0, 10);
+}
+
+function isPastOrToday(dateString) {
+  return Boolean(dateString) && dateString <= localDate();
 }
 
 function formatDate(value) {
@@ -149,6 +181,39 @@ function Photo({ item, blobUrls, className = '', alt = '' }) {
   return (
     <span className={`photo-frame ${className}`}>
       <img src={src} alt={alt} style={cropStyle(item.crop)} />
+    </span>
+  );
+}
+
+/**
+ * Shows an item's photo in full, with a highlighted box over just the region
+ * it was tagged from — the opposite move from Photo above, which zooms in
+ * and hides the rest. Used in the item editor, where there's room to show the
+ * whole outfit photo an item came from instead of a tight crop. Falls back to
+ * the ordinary zoomed view when there is nothing meaningful to highlight (no
+ * crop yet, or a photo that only ever held this one item).
+ */
+function PhotoSpotlight({ item, blobUrls, className = '' }) {
+  const src = itemImage(item, blobUrls);
+  const box = spotlightStyle(item.crop);
+  const alt = `${displayCategory(item.category)} item`;
+
+  if (!src) {
+    return (
+      <div className={`photo-placeholder ${className}`} aria-label={alt}>
+        <span>{CATEGORY_META[item.category]?.icon || '✦'}</span>
+      </div>
+    );
+  }
+
+  if (!box) {
+    return <Photo item={item} blobUrls={blobUrls} className={className} alt={alt} />;
+  }
+
+  return (
+    <span className={`photo-spotlight ${className}`}>
+      <img src={src} alt={`${alt}, highlighted within the photo it was tagged from`} />
+      <span className="spotlight-box" style={box} />
     </span>
   );
 }
@@ -220,10 +285,34 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
   // Reading a wardrobe out of IndexedDB is async, so without this the empty
   // state flashes on every cold launch and tells a stocked wardrobe it is empty.
   const [isLoading, setIsLoading] = useState(() => Boolean(services.listItems));
+  const [outfitRecords, setOutfitRecords] = useState([]);
   const [activeTab, setActiveTab] = useState('wardrobe');
   const [editingItem, setEditingItem] = useState(null);
   const [toast, setToast] = useState('');
   const [blobUrls, setBlobUrls] = useState({});
+  // null | 'edit' | 'build' — the wardrobe grid's multi-select mode. Bulk-edit
+  // and the manual outfit builder share this one mode rather than each having
+  // their own selection UI; which action bar shows depends on the purpose.
+  const [wardrobeMode, setWardrobeMode] = useState(null);
+  // The ids a manually built outfit is being saved from, or null when the
+  // save-a-look modal is closed.
+  const [buildingItemIds, setBuildingItemIds] = useState(null);
+
+  /**
+   * Switches tabs and always drops any in-progress wardrobe selection, so a
+   * half-finished bulk-edit or outfit build never lingers into an unrelated
+   * screen. Entering build mode on purpose (Outfit tab's "Build it myself",
+   * Journal's "Plan an outfit") goes around this on purpose — see below.
+   */
+  const goToTab = (tab) => {
+    setActiveTab(tab);
+    setWardrobeMode(null);
+  };
+
+  const startBuildingOutfit = () => {
+    setActiveTab('wardrobe');
+    setWardrobeMode('build');
+  };
 
   useEffect(() => {
     let isCurrent = true;
@@ -237,6 +326,20 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
       })
       .finally(() => {
         if (isCurrent) setIsLoading(false);
+      });
+    return () => { isCurrent = false; };
+  }, [services, reloadKey]);
+
+  useEffect(() => {
+    let isCurrent = true;
+    if (!services.getOutfitRecords) return undefined;
+    services.getOutfitRecords()
+      .then((loaded) => {
+        if (isCurrent) setOutfitRecords((loaded || []).map(normalizeOutfitEntry));
+      })
+      .catch(() => {
+        // The journal is a nice-to-have view, not core storage — a failure
+        // here should not interrupt anything else the app is doing.
       });
     return () => { isCurrent = false; };
   }, [services, reloadKey]);
@@ -323,20 +426,101 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
     try {
       await services.clearWardrobe?.();
       setItems([]);
+      setOutfitRecords([]);
       setToast('Your wardrobe has been cleared.');
     } catch (error) {
       setToast(error?.message || 'Your wardrobe could not be cleared.');
     }
   };
 
+  /**
+   * Marks a suggested (AI, local, or shuffled) outfit as worn today. Updates
+   * each item's lastWornDate exactly as before, and now also records the
+   * outfit itself so it shows up in the Journal.
+   */
+  const wearOutfit = async ({ itemIds, date, source, explanation }) => {
+    const wornDate = date || localDate();
+    const record = await services.recordOutfitWorn?.({ itemIds, date: wornDate, source, explanation });
+    setItems((current) => current.map((item) => (itemIds.includes(item.id) ? { ...item, lastWornDate: wornDate } : item)));
+    if (record) setOutfitRecords((current) => [normalizeOutfitEntry(record), ...current]);
+  };
+
+  /**
+   * Saves a manually built look — from Outfit's "Build it myself" or
+   * Journal's "Plan an outfit," which both funnel into the same wardrobe
+   * selection mode. A date of today saves it as worn now; any other date
+   * plans it for later. Same modal, same handler, either way.
+   */
+  const saveLook = async ({ itemIds, date, occasion, explanation }) => {
+    try {
+      if (date === localDate()) {
+        await wearOutfit({ itemIds, date, source: 'manual', explanation });
+        setToast('Saved — marked as worn today.');
+      } else {
+        const record = await services.planOutfit?.({ itemIds, date, occasion, explanation });
+        if (record) setOutfitRecords((current) => [normalizeOutfitEntry(record), ...current]);
+        setToast(`Planned for ${formatDate(date)}.`);
+      }
+      setBuildingItemIds(null);
+      setWardrobeMode(null);
+    } catch (error) {
+      setToast(error?.message || 'That look could not be saved.');
+    }
+  };
+
+  const deleteOutfitEntry = async (id) => {
+    if (!window.confirm('Remove this outfit from your journal? This cannot be undone.')) return;
+    try {
+      await services.deleteOutfitRecord?.(id);
+      setOutfitRecords((current) => current.filter((record) => record.id !== id));
+    } catch (error) {
+      setToast(error?.message || 'That outfit could not be removed.');
+    }
+  };
+
+  /**
+   * Applies one change (a tag, a season, a category) to several wardrobe
+   * items at once. The service never returns a photo (bulk-edit never
+   * touches sourcePhotoId), so the existing blob already held in state is
+   * kept rather than dropped.
+   */
+  const bulkUpdateWardrobe = async (ids, changes) => {
+    try {
+      const updated = await services.bulkUpdateItems?.(ids, changes);
+      const byId = new Map((updated || []).map((item) => [item.id, item]));
+      setItems((current) => current.map((item) => {
+        const next = byId.get(item.id);
+        return next ? { ...normalizeItem(next), photo: item.photo } : item;
+      }));
+      setToast(`${ids.length} ${ids.length === 1 ? 'item' : 'items'} updated.`);
+      setWardrobeMode(null);
+    } catch (error) {
+      setToast(error?.message || 'Those items could not be updated.');
+    }
+  };
+
+  const bulkDeleteWardrobe = async (ids) => {
+    if (!window.confirm(`Delete ${ids.length} selected ${ids.length === 1 ? 'item' : 'items'}? This cannot be undone.`)) return;
+    try {
+      for (const id of ids) {
+        await services.deleteItem?.(id);
+      }
+      setItems((current) => current.filter((item) => !ids.includes(item.id)));
+      setToast(`${ids.length} ${ids.length === 1 ? 'item' : 'items'} deleted.`);
+      setWardrobeMode(null);
+    } catch (error) {
+      setToast(error?.message || 'Those items could not be deleted.');
+    }
+  };
+
   return (
     <div className="outfit-app">
       <header className="app-header">
-        <button className="brand" type="button" onClick={() => setActiveTab('wardrobe')} aria-label="Go to wardrobe">
+        <button className="brand" type="button" onClick={() => goToTab('wardrobe')} aria-label="Go to wardrobe">
           <span className="brand-mark">◐</span>
           <span>Outfit Picker</span>
         </button>
-        <button className="header-action" type="button" onClick={() => setActiveTab('upload')} aria-label="Add clothes">
+        <button className="header-action" type="button" onClick={() => goToTab('upload')} aria-label="Add clothes">
           <span>＋</span>
         </button>
       </header>
@@ -348,15 +532,20 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
             items={items}
             blobUrls={blobUrls}
             onOpenItem={setEditingItem}
-            onAdd={() => setActiveTab('upload')}
-            onSuggest={() => setActiveTab('outfit')}
+            onAdd={() => goToTab('upload')}
+            onSuggest={() => goToTab('outfit')}
+            mode={wardrobeMode}
+            onSetMode={setWardrobeMode}
+            onBulkUpdate={bulkUpdateWardrobe}
+            onBulkDelete={bulkDeleteWardrobe}
+            onBuildOutfit={setBuildingItemIds}
           />
         )}
         {activeTab === 'upload' && (
           <UploadView
             tagPhoto={services.tagPhoto}
             onSaveBatch={saveBatch}
-            onCancel={() => setActiveTab('wardrobe')}
+            onCancel={() => goToTab('wardrobe')}
             onToast={setToast}
           />
         )}
@@ -366,12 +555,20 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
             blobUrls={blobUrls}
             repeatDays={getRepeatDays()}
             onSuggest={services.suggestOutfit}
-            onMarkWorn={async (ids, date) => {
-              await services.markItemsWorn?.(ids, date);
-              setItems((current) => current.map((item) => (ids.includes(item.id) ? { ...item, lastWornDate: date } : item)));
-            }}
-            onAdd={() => setActiveTab('upload')}
+            onWearOutfit={wearOutfit}
+            onAdd={() => goToTab('upload')}
+            onBuildOwn={startBuildingOutfit}
             onToast={setToast}
+          />
+        )}
+        {activeTab === 'journal' && (
+          <JournalView
+            items={items}
+            blobUrls={blobUrls}
+            outfitRecords={outfitRecords}
+            onPlanOutfit={startBuildingOutfit}
+            onDeleteOutfitRecord={deleteOutfitEntry}
+            onAdd={() => goToTab('upload')}
           />
         )}
         {activeTab === 'settings' && (
@@ -380,10 +577,11 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
       </main>
 
       <nav className="bottom-nav" aria-label="Primary navigation">
-        <NavButton icon="▦" label="Wardrobe" active={activeTab === 'wardrobe'} onClick={() => setActiveTab('wardrobe')} />
-        <NavButton icon="＋" label="Add" active={activeTab === 'upload'} onClick={() => setActiveTab('upload')} />
-        <NavButton icon="✦" label="Outfit" active={activeTab === 'outfit'} onClick={() => setActiveTab('outfit')} />
-        <NavButton icon="⚙" label="Settings" active={activeTab === 'settings'} onClick={() => setActiveTab('settings')} />
+        <NavButton icon="▦" label="Wardrobe" active={activeTab === 'wardrobe'} onClick={() => goToTab('wardrobe')} />
+        <NavButton icon="＋" label="Add" active={activeTab === 'upload'} onClick={() => goToTab('upload')} />
+        <NavButton icon="✦" label="Outfit" active={activeTab === 'outfit'} onClick={() => goToTab('outfit')} />
+        <NavButton icon="◷" label="Journal" active={activeTab === 'journal'} onClick={() => goToTab('journal')} />
+        <NavButton icon="⚙" label="Settings" active={activeTab === 'settings'} onClick={() => goToTab('settings')} />
       </nav>
 
       {editingItem && (
@@ -393,6 +591,15 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
           onClose={() => setEditingItem(null)}
           onSave={updateItem}
           onDelete={deleteItem}
+        />
+      )}
+      {buildingItemIds && (
+        <SaveLookModal
+          items={items}
+          blobUrls={blobUrls}
+          itemIds={buildingItemIds}
+          onClose={() => { setBuildingItemIds(null); setWardrobeMode(null); }}
+          onSave={saveLook}
         />
       )}
       <div className="toast-region" role="status" aria-live="polite">
@@ -411,29 +618,75 @@ function NavButton({ icon, label, active, onClick }) {
   );
 }
 
-function WardrobeView({ items, blobUrls, onOpenItem, onAdd, onSuggest, isLoading }) {
+function WardrobeView({
+  items, blobUrls, onOpenItem, onAdd, onSuggest, isLoading,
+  mode, onSetMode, onBulkUpdate, onBulkDelete, onBuildOutfit,
+}) {
   const [filter, setFilter] = useState('all');
+  const [selectedIds, setSelectedIds] = useState([]);
+  const [bulkTag, setBulkTag] = useState('');
+  const [bulkSeason, setBulkSeason] = useState(SEASON_WEATHER_VALUES[0]);
   const filteredItems = useMemo(
     () => (filter === 'all' ? items : items.filter((item) => item.category === filter)),
     [filter, items],
   );
+
+  const selecting = mode === 'edit' || mode === 'build';
+
+  useEffect(() => {
+    if (!selecting) setSelectedIds([]);
+  }, [selecting]);
+
+  const toggleSelected = (id) => {
+    setSelectedIds((current) => (current.includes(id) ? current.filter((entry) => entry !== id) : [...current, id]));
+  };
+
+  const cancelSelecting = () => {
+    onSetMode(null);
+    setSelectedIds([]);
+  };
+
+  const addTagToSelected = () => {
+    const tag = bulkTag.trim();
+    if (!tag || !selectedIds.length) return;
+    onBulkUpdate(selectedIds, (item) => ({ styleTags: [...new Set([...item.styleTags, tag])] }));
+    setBulkTag('');
+  };
+
+  const setSeasonForSelected = () => {
+    if (!selectedIds.length) return;
+    onBulkUpdate(selectedIds, { seasons: [bulkSeason] });
+  };
 
   return (
     <section className="screen wardrobe-screen">
       <div className="screen-heading wardrobe-heading">
         <div>
           <p className="eyebrow">YOUR CLOSET</p>
-          <h1>What are we wearing?</h1>
+          <h1>{mode === 'build' ? 'Pick the pieces' : 'What are we wearing?'}</h1>
         </div>
-        <span className="item-count">{items.length} {items.length === 1 ? 'piece' : 'pieces'}</span>
+        {selecting ? (
+          <button className="text-button" type="button" onClick={cancelSelecting}>Cancel</button>
+        ) : (
+          <span className="item-count">{items.length} {items.length === 1 ? 'piece' : 'pieces'}</span>
+        )}
       </div>
 
-      {items.length > 0 && (
-        <button className="suggest-strip" type="button" onClick={onSuggest}>
-          <span className="sparkle">✦</span>
-          <span><strong>Pick an outfit for me</strong><small>Tell me the plan, I’ll do the styling</small></span>
-          <span className="arrow">→</span>
-        </button>
+      {mode === 'build' && (
+        <p className="inline-note">Tap the pieces for your look, then save it — worn today, or planned for later.</p>
+      )}
+
+      {!selecting && items.length > 0 && (
+        <>
+          <button className="suggest-strip" type="button" onClick={onSuggest}>
+            <span className="sparkle">✦</span>
+            <span><strong>Pick an outfit for me</strong><small>Tell me the plan, I’ll do the styling</small></span>
+            <span className="arrow">→</span>
+          </button>
+          <button className="secondary-button full-width select-toggle" type="button" onClick={() => onSetMode('edit')}>
+            Select pieces to edit or delete
+          </button>
+        </>
       )}
 
       <div className="filter-scroll" aria-label="Filter by category">
@@ -455,23 +708,62 @@ function WardrobeView({ items, blobUrls, onOpenItem, onAdd, onSuggest, isLoading
         </div>
       ) : filteredItems.length ? (
         <div className="wardrobe-grid">
-          {filteredItems.map((item) => (
-            <button className="wardrobe-card" type="button" key={item.id} onClick={() => onOpenItem(item)}>
-              <Photo item={item} blobUrls={blobUrls} className="wardrobe-photo" alt={`${displayCategory(item.category)} item`} />
-              <span className="card-copy">
-                <span className="card-category">{displayCategory(item.category)}</span>
-                <span className="card-colors">{item.colors.length ? item.colors.join(' · ') : 'Untitled piece'}</span>
-              </span>
-              {item.lastWornDate && <span className="worn-badge">Worn {formatDate(item.lastWornDate)}</span>}
+          {filteredItems.map((item) => {
+            const isSelected = selectedIds.includes(item.id);
+            return (
+              <button
+                className={`wardrobe-card ${isSelected ? 'is-selected' : ''}`}
+                type="button"
+                key={item.id}
+                onClick={() => (selecting ? toggleSelected(item.id) : onOpenItem(item))}
+              >
+                <Photo item={item} blobUrls={blobUrls} className="wardrobe-photo" alt={`${displayCategory(item.category)} item`} />
+                {selecting && <span className={`select-check ${isSelected ? 'is-checked' : ''}`} aria-hidden="true">{isSelected ? '✓' : ''}</span>}
+                <span className="card-copy">
+                  <span className="card-category">{displayCategory(item.category)}</span>
+                  <span className="card-colors">{item.colors.length ? item.colors.join(' · ') : 'Untitled piece'}</span>
+                </span>
+                {item.lastWornDate && <span className="worn-badge">Worn {formatDate(item.lastWornDate)}</span>}
+              </button>
+            );
+          })}
+          {!selecting && (
+            <button className="add-card" type="button" onClick={onAdd}>
+              <span>＋</span>
+              <strong>Add a piece</strong>
             </button>
-          ))}
-          <button className="add-card" type="button" onClick={onAdd}>
-            <span>＋</span>
-            <strong>Add a piece</strong>
-          </button>
+          )}
         </div>
       ) : (
         <EmptyWardrobe filter={filter} onAdd={onAdd} />
+      )}
+
+      {mode === 'edit' && selectedIds.length > 0 && (
+        <div className="bulk-action-bar">
+          <p>{selectedIds.length} selected</p>
+          <div className="bulk-action-row">
+            <input value={bulkTag} placeholder="Add a style tag…" onChange={(event) => setBulkTag(event.target.value)} />
+            <button className="secondary-button compact" type="button" disabled={!bulkTag.trim()} onClick={addTagToSelected}>Add tag</button>
+          </div>
+          <div className="bulk-action-row">
+            <select value={bulkSeason} onChange={(event) => setBulkSeason(event.target.value)}>
+              {SEASON_WEATHER_VALUES.map((value) => <option key={value} value={value}>{value}</option>)}
+            </select>
+            <button className="secondary-button compact" type="button" onClick={setSeasonForSelected}>Set season</button>
+          </div>
+          <button className="danger-button full-width" type="button" onClick={() => onBulkDelete(selectedIds)}>
+            Delete {selectedIds.length} {selectedIds.length === 1 ? 'piece' : 'pieces'}
+          </button>
+        </div>
+      )}
+
+      {mode === 'build' && selectedIds.length > 0 && (
+        <div className="bulk-action-bar">
+          <p>{selectedIds.length} {selectedIds.length === 1 ? 'piece' : 'pieces'} selected</p>
+          <button className="primary-button full-width" type="button" onClick={() => onBuildOutfit(selectedIds)}>
+            Save this look <span>→</span>
+          </button>
+        </div>
       )}
     </section>
   );
@@ -876,7 +1168,7 @@ function ReviewItemCard({ item, index, preview, selected, onToggleMerge, onChang
   );
 }
 
-function OutfitView({ items, blobUrls, repeatDays, onSuggest, onMarkWorn, onAdd, onToast }) {
+function OutfitView({ items, blobUrls, repeatDays, onSuggest, onWearOutfit, onAdd, onBuildOwn, onToast }) {
   const [preferences, setPreferences] = useState({
     occasion: 'Everyday',
     weather: 'mild',
@@ -902,13 +1194,15 @@ function OutfitView({ items, blobUrls, repeatDays, onSuggest, onMarkWorn, onAdd,
     try {
       let normalized;
       try {
-        const response = onSuggest && hasAnyProvider()
+        const usingAi = Boolean(onSuggest && hasAnyProvider());
+        const response = usingAi
           ? await onSuggest({ items: candidates, preferences, excludedItemIds: exclude, avoidRecentDays: repeatDays })
           : makeLocalSuggestion(candidates);
         normalized = {
           itemIds: (response?.itemIds || response?.items || []).map((entry) => typeof entry === 'string' ? entry : entry.id),
           explanation: response?.explanation || 'This combination is ready to wear.',
           isFallback: false,
+          source: usingAi ? 'ai' : 'local',
         };
         if (!normalized.itemIds.length) throw new Error('No complete outfit was returned.');
       } catch (error) {
@@ -918,7 +1212,7 @@ function OutfitView({ items, blobUrls, repeatDays, onSuggest, onMarkWorn, onAdd,
         const local = makeLocalSuggestion(candidates);
         if (!local.itemIds.length) throw error;
         onToast(error?.message || 'The AI suggestion failed, so here is a basic pick instead.');
-        normalized = { ...local, isFallback: true };
+        normalized = { ...local, isFallback: true, source: 'local' };
       }
       setSuggestion(normalized);
       setUsedItemIds(exclude);
@@ -929,10 +1223,44 @@ function OutfitView({ items, blobUrls, repeatDays, onSuggest, onMarkWorn, onAdd,
     }
   };
 
+  /**
+   * No AI, no network, cannot fail — a randomised pick from the wardrobe.
+   * Repeated taps give different results within the same category rules the
+   * AI suggestion also respects (weather/style ranking, not worn recently).
+   */
+  const requestShuffle = ({ exclude = [] } = {}) => {
+    const pool = items.filter((item) => !exclude.includes(item.id) || item.id === preferences.wantedItemId);
+    const result = shuffleOutfit(pool, {
+      weather: preferences.weather,
+      occasion: occasionKey(preferences.occasion),
+      vibe: preferences.vibe,
+      requiredItemId: preferences.wantedItemId,
+    }, repeatDays);
+
+    if (!result.itemIds.length) {
+      onToast('Add a few more pieces so there is something to shuffle.');
+      return;
+    }
+    setIsWorn(false);
+    setSuggestion({ ...result, isFallback: false, source: 'shuffle' });
+    setUsedItemIds(exclude);
+  };
+
+  const reroll = () => {
+    const exclude = [...usedItemIds, ...suggestion.itemIds];
+    if (suggestion.source === 'shuffle') requestShuffle({ exclude });
+    else requestSuggestion({ exclude });
+  };
+
   const wearThis = async () => {
     if (!suggestionItems.length) return;
     try {
-      await onMarkWorn(suggestionItems.map((item) => item.id), localDate());
+      await onWearOutfit({
+        itemIds: suggestionItems.map((item) => item.id),
+        date: localDate(),
+        source: suggestion.source,
+        explanation: suggestion.explanation,
+      });
       setIsWorn(true);
       onToast('Marked as worn today. Have a great time!');
     } catch (error) {
@@ -980,8 +1308,8 @@ function OutfitView({ items, blobUrls, repeatDays, onSuggest, onMarkWorn, onAdd,
         <button className={`primary-button full-width ${isWorn ? 'success-button' : ''}`} type="button" onClick={wearThis} disabled={isWorn}>
           {isWorn ? '✓ Worn today' : 'Wear this'}
         </button>
-        <button className="secondary-button full-width" type="button" disabled={isThinking} onClick={() => requestSuggestion({ exclude: [...usedItemIds, ...suggestion.itemIds] })}>
-          {isThinking ? <><span className="button-spinner dark" /> Finding another…</> : <>Suggest another <span>↻</span></>}
+        <button className="secondary-button full-width" type="button" disabled={isThinking} onClick={reroll}>
+          {isThinking ? <><span className="button-spinner dark" /> Finding another…</> : <>{suggestion.source === 'shuffle' ? 'Shuffle again' : 'Suggest another'} <span>↻</span></>}
         </button>
       </section>
     );
@@ -1017,12 +1345,224 @@ function OutfitView({ items, blobUrls, repeatDays, onSuggest, onMarkWorn, onAdd,
       </fieldset>
       <label className="wanted-select">Want to wear something specific?<select value={preferences.wantedItemId} onChange={(event) => setPreferences((current) => ({ ...current, wantedItemId: event.target.value }))}><option value="">No preference — surprise me</option>{items.map((item) => <option key={item.id} value={item.id}>{displayCategory(item.category)} · {item.colors.join(', ') || 'untitled item'}</option>)}</select></label>
       <button className="primary-button full-width suggest-button" type="button" disabled={isThinking} onClick={() => requestSuggestion()}>{isThinking ? <><span className="button-spinner" /> Styling your look…</> : <>Suggest my outfit <span>✦</span></>}</button>
+      <div className="outfit-secondary-actions">
+        <button className="secondary-button" type="button" onClick={() => requestShuffle()}>Shuffle instead <span>↻</span></button>
+        <button className="secondary-button" type="button" onClick={onBuildOwn}>Build it myself <span>→</span></button>
+      </div>
     </section>
   );
 }
 
 function ChoiceButton({ active, children, onClick }) {
   return <button className={`choice-button ${active ? 'is-selected' : ''}`} type="button" onClick={onClick}>{children}</button>;
+}
+
+function JournalView({ items, blobUrls, outfitRecords, onPlanOutfit, onDeleteOutfitRecord, onAdd }) {
+  const [segment, setSegment] = useState('history');
+  const stats = useMemo(() => computeWardrobeStats(items, outfitRecords), [items, outfitRecords]);
+  const itemsById = useMemo(() => new Map(items.map((item) => [item.id, item])), [items]);
+  const outfitThumbs = (record) => record.itemIds.map((id) => itemsById.get(id)).filter(Boolean);
+
+  if (!items.length) {
+    return (
+      <section className="screen journal-screen empty-outfit">
+        <div className="screen-heading"><div><p className="eyebrow">JOURNAL</p><h1>Your outfit history</h1></div></div>
+        <div className="empty-state">
+          <div className="empty-illustration"><span>◷</span><span>✦</span><span>◐</span></div>
+          <h2>Nothing logged yet</h2>
+          <p>Add a few pieces, then wear or plan an outfit and it will show up here.</p>
+          <button className="primary-button" type="button" onClick={onAdd}>Add clothes <span>→</span></button>
+        </div>
+      </section>
+    );
+  }
+
+  return (
+    <section className="screen journal-screen">
+      <div className="screen-heading"><div><p className="eyebrow">JOURNAL</p><h1>What you’ve worn</h1></div></div>
+
+      <div className="segment-toggle" role="tablist">
+        <button className={`segment-button ${segment === 'history' ? 'is-selected' : ''}`} type="button" role="tab" aria-selected={segment === 'history'} onClick={() => setSegment('history')}>History &amp; plans</button>
+        <button className={`segment-button ${segment === 'stats' ? 'is-selected' : ''}`} type="button" role="tab" aria-selected={segment === 'stats'} onClick={() => setSegment('stats')}>Stats</button>
+      </div>
+
+      {segment === 'history' ? (
+        <>
+          <button className="secondary-button full-width" type="button" onClick={onPlanOutfit}>＋ Plan an outfit</button>
+          {outfitRecords.length ? (
+            <div className="journal-list">
+              {outfitRecords.map((record) => (
+                <div className="journal-row" key={record.id}>
+                  <div className="journal-row-photos">
+                    {outfitThumbs(record).slice(0, 4).map((item) => (
+                      <Photo key={item.id} item={item} blobUrls={blobUrls} className="journal-photo" alt={displayCategory(item.category)} />
+                    ))}
+                  </div>
+                  <div className="journal-row-copy">
+                    <strong>{formatDate(record.date)}</strong>
+                    <span className={`journal-badge journal-badge-${record.status}`}>{record.status === 'worn' ? 'Worn' : 'Planned'}</span>
+                    {record.occasion && <small>{record.occasion}</small>}
+                  </div>
+                  <button className="icon-text-button danger-text" type="button" onClick={() => onDeleteOutfitRecord(record.id)} aria-label="Remove this entry">×</button>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="inline-note">Nothing logged yet. Wear a suggested outfit, or plan one ahead.</p>
+          )}
+        </>
+      ) : (
+        <div className="stats-panel">
+          <div className="stats-summary">
+            <div><strong>{stats.totalItems}</strong><span>pieces</span></div>
+            <div><strong>{stats.totalWornOutfits}</strong><span>outfits worn</span></div>
+            <div><strong>{stats.neverWorn.length}</strong><span>never worn</span></div>
+          </div>
+
+          {stats.mostWorn.length > 0 && (
+            <section className="stats-section">
+              <h3>Most worn</h3>
+              <div className="stats-item-row">
+                {stats.mostWorn.map(({ item, wornCount }) => (
+                  <div className="stats-item" key={item.id}>
+                    <Photo item={item} blobUrls={blobUrls} className="stats-photo" alt={displayCategory(item.category)} />
+                    <span>{wornCount}×</span>
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
+
+          {stats.neverWorn.length > 0 && (
+            <section className="stats-section">
+              <h3>Never worn</h3>
+              <div className="stats-item-row">
+                {stats.neverWorn.slice(0, 8).map((item) => (
+                  <div className="stats-item" key={item.id}>
+                    <Photo item={item} blobUrls={blobUrls} className="stats-photo" alt={displayCategory(item.category)} />
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
+
+          {stats.costPerWear.length > 0 && (
+            <section className="stats-section">
+              <h3>Cost per wear</h3>
+              <ul className="stats-list">
+                {stats.costPerWear.map(({ item, costPerWear, wornCount }) => (
+                  <li key={item.id}>
+                    <span>{displayCategory(item.category)} · {item.colors.join(', ') || 'untitled'}</span>
+                    <strong>{costPerWear.toFixed(2)}/wear</strong>
+                    <small>{wornCount}×</small>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+
+          <section className="stats-section">
+            <h3>By category</h3>
+            <div className="filter-scroll" aria-label="Category breakdown">
+              {stats.categoryBreakdown.map(({ category, count }) => (
+                <FilterChip key={category} label={displayCategory(category)} count={count} active={false} onClick={() => {}} />
+              ))}
+            </div>
+          </section>
+        </div>
+      )}
+    </section>
+  );
+}
+
+/**
+ * Saves a manually built outfit — reached from Outfit's "Build it myself" and
+ * Journal's "Plan an outfit," both of which land here through the same
+ * wardrobe selection mode. The date field IS the planning mechanism: today
+ * saves it as worn, any other date plans it, with no separate calendar UI.
+ */
+function SaveLookModal({ items, blobUrls, itemIds, onClose, onSave }) {
+  const [date, setDate] = useState(() => localDate());
+  const [occasion, setOccasion] = useState('');
+  const [explanation, setExplanation] = useState('');
+  const [isSaving, setIsSaving] = useState(false);
+  const dialogRef = useRef(null);
+
+  const selectedItems = itemIds.map((id) => items.find((item) => item.id === id)).filter(Boolean);
+  const isToday = date === localDate();
+
+  // Same Escape / focus-trap / focus-restore behaviour as the item editor.
+  useEffect(() => {
+    const opener = document.activeElement;
+    dialogRef.current?.focus();
+
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape') {
+        event.stopPropagation();
+        onClose();
+        return;
+      }
+      if (event.key !== 'Tab') return;
+
+      const focusable = dialogRef.current?.querySelectorAll(
+        'button:not([disabled]), input:not([disabled]), select, textarea, [href]',
+      );
+      if (!focusable?.length) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+
+    document.addEventListener('keydown', onKeyDown, true);
+    return () => {
+      document.removeEventListener('keydown', onKeyDown, true);
+      if (opener instanceof HTMLElement) opener.focus();
+    };
+  }, [onClose]);
+
+  const save = async () => {
+    setIsSaving(true);
+    try {
+      await onSave({ itemIds, date, occasion, explanation });
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <section className="item-editor" role="dialog" aria-modal="true" aria-labelledby="save-look-title" ref={dialogRef} tabIndex={-1}>
+        <div className="modal-handle" />
+        <div className="editor-header">
+          <div><p className="eyebrow">YOUR LOOK</p><h2 id="save-look-title">Save this outfit</h2></div>
+          <button className="close-button" type="button" onClick={onClose} aria-label="Close">×</button>
+        </div>
+        <div className="outfit-row">
+          {selectedItems.map((item) => (
+            <div className="outfit-piece" key={item.id}>
+              <Photo item={item} blobUrls={blobUrls} className="outfit-photo" alt={displayCategory(item.category)} />
+              <span>{displayCategory(item.category)}</span>
+            </div>
+          ))}
+        </div>
+        <div className="form-grid editor-fields">
+          <label className="span-two">Date<input type="date" value={date} onChange={(event) => setDate(event.target.value || localDate())} /></label>
+          <label className="span-two">Occasion (optional)<input value={occasion} placeholder="e.g. work, date night" onChange={(event) => setOccasion(event.target.value)} /></label>
+          <label className="span-two">Notes (optional)<input value={explanation} placeholder="Why this works, what to remember…" onChange={(event) => setExplanation(event.target.value)} /></label>
+        </div>
+        <p className="inline-note">{isToday ? 'Saved as worn today.' : `Planned for ${formatDate(date)} — not marked as worn until then.`}</p>
+        <button className="primary-button full-width" type="button" disabled={isSaving || !selectedItems.length} onClick={save}>
+          {isSaving ? 'Saving…' : isToday ? 'Save — wear it today' : 'Save for later'}
+        </button>
+      </section>
+    </div>
+  );
 }
 
 function SettingsView({ onClear, onToast }) {
@@ -1337,7 +1877,7 @@ function ItemEditor({ item, blobUrls, onClose, onSave, onDelete }) {
       <section className="item-editor" role="dialog" aria-modal="true" aria-labelledby="editor-title" ref={dialogRef} tabIndex={-1}>
         <div className="modal-handle" />
         <div className="editor-header"><div><p className="eyebrow">EDIT PIECE</p><h2 id="editor-title">Make it yours</h2></div><button className="close-button" type="button" onClick={onClose} aria-label="Close editor">×</button></div>
-        <Photo item={draft} blobUrls={blobUrls} className="editor-photo" alt={`${displayCategory(draft.category)} item`} />
+        <PhotoSpotlight item={draft} blobUrls={blobUrls} className="editor-photo" />
         <CropControls crop={draft.crop} idPrefix={`editor-${draft.id}`} onChange={(crop) => update({ crop })} />
         <div className="form-grid editor-fields">
           <label>Category<select value={draft.category} onChange={(event) => update({ category: event.target.value })}>{CATEGORIES.map((category) => <option key={category} value={category}>{displayCategory(category)}</option>)}</select></label>
@@ -1345,7 +1885,8 @@ function ItemEditor({ item, blobUrls, onClose, onSave, onDelete }) {
           <label className="span-two">Style tags<input value={draft.styleTags.join(', ')} placeholder="e.g. relaxed, smart casual" onChange={(event) => updateList('styleTags', event.target.value)} /></label>
           <label className="span-two">Season / weather<input value={draft.seasons.join(', ')} placeholder="e.g. cool, autumn" onChange={(event) => updateList('seasons', event.target.value)} /><small className="field-hint">{SEASON_HINT}</small></label>
           <label className="span-two">Notes<textarea value={draft.notes} rows="3" placeholder="Fit notes, how you like to wear it…" onChange={(event) => update({ notes: event.target.value })} /></label>
-          <div className="last-worn-row span-two"><span>Last worn</span><strong>{formatDate(draft.lastWornDate)}</strong></div>
+          <label>Price paid <span className="field-hint-inline">(optional)</span><input type="number" min="0" step="0.01" inputMode="decimal" value={draft.pricePaid ?? ''} placeholder="for cost-per-wear" onChange={(event) => update({ pricePaid: event.target.value === '' ? null : Number(event.target.value) })} /></label>
+          <div className="last-worn-row"><span>Last worn</span><strong>{formatDate(draft.lastWornDate)}</strong></div>
         </div>
         <button className="primary-button full-width" type="button" disabled={isSaving} onClick={save}>{isSaving ? 'Saving…' : 'Save changes'}</button>
         <button className="danger-text-button" type="button" onClick={() => onDelete(draft.id)}>Delete this piece</button>

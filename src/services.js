@@ -7,13 +7,18 @@
  */
 
 import {
+  bulkUpdateItems as bulkUpdateStoredItems,
   clearAll,
   deleteItem as deleteStoredItem,
   deleteOrphanPhotos,
+  deleteOutfitRecord as deleteStoredOutfitRecord,
   getItems,
+  getOutfitRecords as getStoredOutfitRecords,
   getPhotos,
+  saveOutfitRecord,
   savePhotoBatches,
   updateItem as updateStoredItem,
+  updateOutfitRecord as updateStoredOutfitRecord,
 } from './lib/db.js';
 import { prepareImage } from './lib/image.js';
 import { suggestOutfit as requestOutfit, tagPhoto as requestTags } from './lib/ai.js';
@@ -52,6 +57,7 @@ function toAppItem(item, photos) {
     seasons: [...item.seasons, ...item.weatherSuitability],
     notes: item.notes,
     lastWornDate: item.lastWornDate || '',
+    pricePaid: item.pricePaid ?? null,
     crop: item.crop,
   };
 }
@@ -67,6 +73,7 @@ function toStoredItem(item, sourcePhotoId) {
     weatherSuitability: normalizeWeatherSuitability(item.seasons),
     notes: item.notes,
     lastWornDate: item.lastWornDate,
+    pricePaid: item.pricePaid ?? null,
     crop: item.crop,
   };
 }
@@ -137,6 +144,67 @@ export async function markItemsWorn(ids, date) {
   }
 }
 
+/**
+ * Marks a whole outfit as worn: updates each item's lastWornDate exactly as
+ * before (the existing recency filtering in lib/outfit.js still reads that),
+ * and additionally writes one outfit record so the Journal has something to
+ * show beyond a per-item date. This is what "Wear this" calls now.
+ */
+export async function recordOutfitWorn({ itemIds, date, source = 'manual', explanation = '', occasion = '' }) {
+  const wornDate = date || toLocalDateString();
+  await markItemsWorn(itemIds, wornDate);
+  return saveOutfitRecord({ itemIds, date: wornDate, status: 'worn', source, explanation, occasion });
+}
+
+/**
+ * Saves a future-dated outfit for the journal's planning side. Deliberately
+ * does not touch any item's lastWornDate — that only changes once an outfit
+ * is actually worn, not when it's merely planned.
+ */
+export async function planOutfit({ itemIds, date, occasion = '', explanation = '' }) {
+  return saveOutfitRecord({ itemIds, date, status: 'planned', source: 'manual', occasion, explanation });
+}
+
+export async function getOutfitRecords(range) {
+  return getStoredOutfitRecords(range);
+}
+
+export async function updateOutfitRecord(id, changes) {
+  return updateStoredOutfitRecord(id, changes);
+}
+
+export async function deleteOutfitRecord(id) {
+  return deleteStoredOutfitRecord(id);
+}
+
+/**
+ * Applies the same change (a tag, a season, a category) to several wardrobe
+ * items at once. `changes` may be a plain object (uniform for every item) or
+ * a function of the item's current app-shaped fields, for a per-item merge —
+ * e.g. adding one tag to each item's own existing tags rather than replacing
+ * them all with a single-tag list. Either way, a `seasons` field is split
+ * into the stored seasons/weatherSuitability pair the same way a single
+ * item's edit already is. Returned records carry no photo — bulk-edit never
+ * touches sourcePhotoId, so the caller already has the right blob in its own
+ * state and should keep it rather than have this refetch photos it doesn't need.
+ */
+export async function bulkUpdateItems(ids, changes) {
+  const toStoredPatch = (storedItem) => {
+    const rawPatch = typeof changes === 'function' ? changes(toAppItem(storedItem)) : changes;
+    if (!rawPatch) return {};
+
+    const patch = { ...rawPatch };
+    if ('seasons' in patch) {
+      patch.weatherSuitability = normalizeWeatherSuitability(patch.seasons);
+      patch.seasons = normalizeSeasons(patch.seasons);
+    }
+    return patch;
+  };
+
+  const updated = await bulkUpdateStoredItems(ids, toStoredPatch);
+  return updated.map((item) => toAppItem(item));
+}
+
 export async function clearWardrobe() {
   await clearAll();
 }
@@ -202,6 +270,12 @@ export const services = {
   updateItem,
   deleteItem,
   markItemsWorn,
+  recordOutfitWorn,
+  planOutfit,
+  getOutfitRecords,
+  updateOutfitRecord,
+  deleteOutfitRecord,
+  bulkUpdateItems,
   clearWardrobe,
   suggestOutfit,
 };

@@ -1,12 +1,14 @@
 import {
+  normalizeOutfitRecord,
   normalizePhotoRecord,
   normalizeWardrobeItem,
 } from '../types.js';
 
 export const DB_NAME = 'outfit-picker';
-export const DB_VERSION = 1;
+export const DB_VERSION = 2;
 export const PHOTO_STORE = 'photos';
 export const ITEM_STORE = 'items';
+export const OUTFIT_STORE = 'outfits';
 
 let databasePromise;
 
@@ -55,12 +57,20 @@ function upgradeDatabase(database, transaction) {
   const items = database.objectStoreNames.contains(ITEM_STORE)
     ? transaction.objectStore(ITEM_STORE)
     : database.createObjectStore(ITEM_STORE, { keyPath: 'id' });
+  // Added in DB_VERSION 2. objectStoreNames.contains/ensureIndex make this
+  // additive and idempotent, so upgrading from version 1 never touches the
+  // existing photos or items already on disk.
+  const outfits = database.objectStoreNames.contains(OUTFIT_STORE)
+    ? transaction.objectStore(OUTFIT_STORE)
+    : database.createObjectStore(OUTFIT_STORE, { keyPath: 'id' });
 
   ensureIndex(photos, 'createdAt', 'createdAt');
   ensureIndex(items, 'category', 'category');
   ensureIndex(items, 'sourcePhotoId', 'sourcePhotoId');
   ensureIndex(items, 'lastWornDate', 'lastWornDate');
   ensureIndex(items, 'createdAt', 'createdAt');
+  ensureIndex(outfits, 'date', 'date');
+  ensureIndex(outfits, 'status', 'status');
 }
 
 /**
@@ -384,13 +394,129 @@ export async function deleteOrphanPhotos() {
 }
 
 /**
- * Clears every stored wardrobe item and photo in a single transaction.
+ * Applies a change to several items in one transaction. `changes` is either a
+ * plain object applied identically to every item ("set season to winter"), or
+ * a function `(storedItem) => partialChanges` for a per-item computed patch
+ * ("add this tag to whatever tags each item already has" — a uniform object
+ * would instead replace each item's tags outright, since a stored item is
+ * built as `{...item, ...changes}`).
+ */
+export async function bulkUpdateItems(ids, changes = {}) {
+  const wanted = [...new Set((ids || []).filter(Boolean))];
+  if (!wanted.length) {
+    return [];
+  }
+
+  return withTransaction(ITEM_STORE, 'readwrite', async (transaction) => {
+    const store = transaction.objectStore(ITEM_STORE);
+    const existing = await Promise.all(wanted.map((id) => requestToPromise(store.get(id))));
+    const now = new Date();
+
+    const updated = existing
+      .filter(Boolean)
+      .map((item) => {
+        const patch = typeof changes === 'function' ? (changes(item) || {}) : changes;
+        return normalizeSavedItem(
+          { ...item, ...patch, id: item.id, createdAt: item.createdAt, updatedAt: now.toISOString() },
+          now,
+        );
+      });
+
+    await Promise.all(updated.map((item) => requestToPromise(store.put(item))));
+    return updated;
+  });
+}
+
+/**
+ * Saves one outfit record — a date plus the items worn or planned for it.
+ * The same record shape covers both wear history (status "worn") and the
+ * journal's forward planning (status "planned").
+ */
+export async function saveOutfitRecord(value) {
+  const record = normalizeOutfitRecord(value);
+  if (!record.itemIds.length) {
+    throw new Error('An outfit record needs at least one item.');
+  }
+
+  return withTransaction(OUTFIT_STORE, 'readwrite', async (transaction) => {
+    await requestToPromise(transaction.objectStore(OUTFIT_STORE).put(record));
+    return record;
+  });
+}
+
+/**
+ * Reads outfit records, newest date first. Pass { from, to } ('YYYY-MM-DD',
+ * inclusive) and/or { status } to narrow the range — used to split the
+ * journal into history (dates up to today) and planned (dates after today)
+ * without two separate stores.
+ */
+export async function getOutfitRecords({ from, to, status } = {}) {
+  return withTransaction(OUTFIT_STORE, 'readonly', async (transaction) => {
+    const store = transaction.objectStore(OUTFIT_STORE);
+    const request = status && store.indexNames.contains('status')
+      ? store.index('status').getAll(status)
+      : store.getAll();
+    const records = await requestToPromise(request);
+
+    return records
+      .map((record) => normalizeOutfitRecord(record))
+      .filter((record) => (!from || record.date >= from) && (!to || record.date <= to))
+      .sort((left, right) => right.date.localeCompare(left.date) || right.createdAt.localeCompare(left.createdAt));
+  });
+}
+
+export async function updateOutfitRecord(id, changes = {}) {
+  if (!id) {
+    throw new Error('updateOutfitRecord requires an outfit id.');
+  }
+
+  return withTransaction(OUTFIT_STORE, 'readwrite', async (transaction) => {
+    const store = transaction.objectStore(OUTFIT_STORE);
+    const existing = await requestToPromise(store.get(id));
+    if (!existing) {
+      return null;
+    }
+
+    const updated = normalizeOutfitRecord({
+      ...existing,
+      ...changes,
+      id: existing.id,
+      createdAt: existing.createdAt,
+      updatedAt: new Date().toISOString(),
+    });
+
+    await requestToPromise(store.put(updated));
+    return updated;
+  });
+}
+
+export async function deleteOutfitRecord(id) {
+  if (!id) {
+    return false;
+  }
+
+  return withTransaction(OUTFIT_STORE, 'readwrite', async (transaction) => {
+    const store = transaction.objectStore(OUTFIT_STORE);
+    const existing = await requestToPromise(store.get(id));
+    if (!existing) {
+      return false;
+    }
+
+    await requestToPromise(store.delete(id));
+    return true;
+  });
+}
+
+/**
+ * Clears every stored wardrobe item, photo, and outfit record in a single
+ * transaction.
  */
 export async function clearAll() {
-  return withTransaction([PHOTO_STORE, ITEM_STORE], 'readwrite', async (transaction) => {
+  return withTransaction([PHOTO_STORE, ITEM_STORE, OUTFIT_STORE], 'readwrite', async (transaction) => {
     await Promise.all([
       requestToPromise(transaction.objectStore(PHOTO_STORE).clear()),
       requestToPromise(transaction.objectStore(ITEM_STORE).clear()),
+      requestToPromise(transaction.objectStore(OUTFIT_STORE).clear()),
     ]);
   });
 }

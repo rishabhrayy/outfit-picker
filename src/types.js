@@ -320,7 +320,49 @@ export function normalizeWardrobeItem(value = {}, { now = new Date() } = {}) {
       ),
     notes: cleanString(value.notes, 4_000),
     lastWornDate: normalizeDate(firstDefined(value.lastWornDate, value.last_worn_date)),
+    // Optional — only entered if the owner wants cost-per-wear. Never required,
+    // and never used for anything shopping-related.
+    pricePaid: normalizePositiveNumber(firstDefined(value.pricePaid, value.price_paid)),
     crop: normalizeCrop(firstDefined(value.crop, value.cropRect, value.crop_rect)),
+    createdAt: normalizeTimestamp(value.createdAt, timestamp),
+    updatedAt: normalizeTimestamp(value.updatedAt, timestamp),
+  };
+}
+
+function normalizePositiveNumber(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+const OUTFIT_STATUSES = new Set(['worn', 'planned']);
+const OUTFIT_SOURCES = new Set(['ai', 'local', 'shuffle', 'manual']);
+
+/**
+ * Produces the canonical outfit-record shape stored in IndexedDB: a date plus
+ * the items worn or planned for it. The same shape serves both wear history
+ * (status "worn", a past or today's date) and the outfit journal's forward
+ * planning (status "planned", a future date) — it is the same kind of record
+ * either way, just which side of today it falls on.
+ */
+export function normalizeOutfitRecord(value = {}, { now = new Date() } = {}) {
+  const timestamp = normalizeTimestamp(now, new Date().toISOString());
+  const itemIds = [...new Set(
+    (Array.isArray(value.itemIds) ? value.itemIds : [])
+      .map((id) => cleanString(id, 160))
+      .filter(Boolean),
+  )];
+
+  const status = OUTFIT_STATUSES.has(value.status) ? value.status : 'worn';
+  const source = OUTFIT_SOURCES.has(value.source) ? value.source : 'manual';
+
+  return {
+    id: cleanId(value.id, 'outfit'),
+    date: normalizeDate(value.date) || toLocalDateString(now),
+    itemIds,
+    status,
+    source,
+    explanation: cleanString(value.explanation, 1_000),
+    occasion: cleanString(value.occasion, 120),
     createdAt: normalizeTimestamp(value.createdAt, timestamp),
     updatedAt: normalizeTimestamp(value.updatedAt, timestamp),
   };
