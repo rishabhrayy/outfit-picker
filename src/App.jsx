@@ -6,17 +6,20 @@ import {
   cropFromControls,
   cropStyle,
 } from './lib/crop.js';
-import { filterWardrobeForOutfit, hasEnoughForSuggestion, occasionKey } from './lib/outfit.js';
-import { PROVIDERS, PROVIDER_IDS, detectProvider } from './lib/providers.js';
+import { filterWardrobeForOutfit, missingForCompleteOutfit, occasionKey } from './lib/outfit.js';
+import { DEFAULT_PRESET_ID, PROVIDER_PRESETS, detectPresetFromKey, getPreset } from './lib/providers.js';
+import { testProvider } from './lib/ai.js';
 import {
   MAX_REPEAT_DAYS,
-  getApiKey,
-  getProvider,
+  addProvider,
+  deleteProvider,
+  getActiveProviderId,
+  getProviders,
   getRepeatDays,
-  hasApiKey,
-  setApiKey,
-  setProvider,
+  hasAnyProvider,
+  setActiveProviderId,
   setRepeatDays,
+  updateProvider,
 } from './lib/settings.js';
 import './App.css';
 
@@ -891,20 +894,32 @@ function OutfitView({ items, blobUrls, repeatDays, onSuggest, onMarkWorn, onAdd,
   const requestSuggestion = async ({ exclude = [] } = {}) => {
     const candidates = shortlistForSuggestion(items, preferences, repeatDays, exclude);
     if (!candidates.length) {
-      onToast('There are no unused matching pieces left. Try changing your answers.');
+      onToast('There are no unused pieces left to try. Change your answers, or start over with "Suggest my outfit".');
       return;
     }
     setIsThinking(true);
     setIsWorn(false);
     try {
-      const response = onSuggest && hasApiKey()
-        ? await onSuggest({ items: candidates, preferences, excludedItemIds: exclude, avoidRecentDays: repeatDays })
-        : makeLocalSuggestion(candidates);
-      const normalized = {
-        itemIds: (response?.itemIds || response?.items || []).map((entry) => typeof entry === 'string' ? entry : entry.id),
-        explanation: response?.explanation || 'This combination is ready to wear.',
-      };
-      if (!normalized.itemIds.length) throw new Error('No complete outfit was returned. Try a different set of answers.');
+      let normalized;
+      try {
+        const response = onSuggest && hasAnyProvider()
+          ? await onSuggest({ items: candidates, preferences, excludedItemIds: exclude, avoidRecentDays: repeatDays })
+          : makeLocalSuggestion(candidates);
+        normalized = {
+          itemIds: (response?.itemIds || response?.items || []).map((entry) => typeof entry === 'string' ? entry : entry.id),
+          explanation: response?.explanation || 'This combination is ready to wear.',
+          isFallback: false,
+        };
+        if (!normalized.itemIds.length) throw new Error('No complete outfit was returned.');
+      } catch (error) {
+        // A failed AI call should not leave the screen empty — fall back to a
+        // simple local pick so there is always something to look at, and say
+        // plainly that this one skipped the AI step.
+        const local = makeLocalSuggestion(candidates);
+        if (!local.itemIds.length) throw error;
+        onToast(error?.message || 'The AI suggestion failed, so here is a basic pick instead.');
+        normalized = { ...local, isFallback: true };
+      }
       setSuggestion(normalized);
       setUsedItemIds(exclude);
     } catch (error) {
@@ -925,14 +940,17 @@ function OutfitView({ items, blobUrls, repeatDays, onSuggest, onMarkWorn, onAdd,
     }
   };
 
-  if (!hasEnoughForSuggestion(items)) {
+  // Block only on a genuinely empty wardrobe. A wardrobe missing one category
+  // (no shoes yet, say) still deserves a suggestion — it just says so, rather
+  // than refusing outright.
+  if (!items.length) {
     return (
       <section className="screen outfit-screen empty-outfit">
         <div className="screen-heading"><div><p className="eyebrow">OUTFIT PICKER</p><h1>Let’s get dressed</h1></div></div>
         <div className="empty-state">
           <div className="empty-illustration warm"><span>✦</span><span>◐</span><span>⌁</span></div>
           <h2>Add a few pieces first</h2>
-          <p>Once your wardrobe has a top, bottom or dress, and shoes, I can start assembling outfits.</p>
+          <p>Once you have added some clothes, I can start assembling outfits.</p>
           <button className="primary-button" type="button" onClick={onAdd}>Add clothes <span>→</span></button>
         </div>
       </section>
@@ -954,6 +972,9 @@ function OutfitView({ items, blobUrls, repeatDays, onSuggest, onMarkWorn, onAdd,
             </div>
           ))}
         </div>
+        {suggestion.isFallback && (
+          <p className="inline-note">This is a basic pick, not an AI suggestion — styling failed this time.</p>
+        )}
         <div className="explanation-card"><span>✦</span><p>{suggestion.explanation}</p></div>
         <div className="recent-note">Avoiding pieces worn in the last {repeatDays} days where possible.</div>
         <button className={`primary-button full-width ${isWorn ? 'success-button' : ''}`} type="button" onClick={wearThis} disabled={isWorn}>
@@ -966,9 +987,16 @@ function OutfitView({ items, blobUrls, repeatDays, onSuggest, onMarkWorn, onAdd,
     );
   }
 
+  const missing = missingForCompleteOutfit(items);
+
   return (
     <section className="screen outfit-screen question-screen">
       <div className="screen-heading"><div><p className="eyebrow">OUTFIT PICKER</p><h1>What’s the plan?</h1><p className="heading-copy">A few details and I’ll pull a look from your closet.</p></div></div>
+      {missing.length > 0 && (
+        <p className="inline-note">
+          No {missing.join(' or ')} in your wardrobe yet — I’ll style what you have.
+        </p>
+      )}
       <fieldset className="question-block">
         <legend>Where are you going?</legend>
         <div className="choice-grid occasion-grid">
@@ -998,65 +1026,256 @@ function ChoiceButton({ active, children, onClick }) {
 }
 
 function SettingsView({ onClear, onToast }) {
-  const [providerId, setProviderDraft] = useState(getProvider);
-  // Keys are kept per provider, so switching does not throw the other one away.
-  const [keys, setKeys] = useState(() => Object.fromEntries(PROVIDER_IDS.map((id) => [id, getApiKey(id)])));
-  const [showKey, setShowKey] = useState(false);
+  const [providers, setProviders] = useState(getProviders);
+  const [activeId, setActiveId] = useState(getActiveProviderId);
+  // null = nothing open, 'new' = the add-provider form, or a provider id being edited.
+  const [openFormId, setOpenFormId] = useState(null);
   const [repeatDays, setRepeatDaysDraft] = useState(getRepeatDays);
-  const [saved, setSaved] = useState(false);
 
-  const provider = PROVIDERS[providerId];
-  const apiKey = keys[providerId] || '';
-  const mismatch = detectProvider(apiKey);
+  const refresh = () => {
+    setProviders(getProviders());
+    setActiveId(getActiveProviderId());
+  };
 
-  const saveSettings = () => {
-    const stored = PROVIDER_IDS.every((id) => setApiKey(keys[id] || '', id))
-      && setProvider(providerId)
-      && setRepeatDays(repeatDays);
-    if (!stored) {
-      onToast('This browser is blocking local storage, so settings could not be saved.');
-      return;
+  const makeActive = (id) => {
+    setActiveProviderId(id);
+    refresh();
+  };
+
+  const removeProvider = (id, label) => {
+    if (!window.confirm(`Remove ${label || 'this provider'}? Its saved key will be deleted from this device.`)) return;
+    deleteProvider(id);
+    refresh();
+    onToast('Provider removed.');
+  };
+
+  const changeRepeatDays = (value) => {
+    setRepeatDaysDraft(value);
+    if (!setRepeatDays(value)) {
+      onToast('This browser is blocking local storage, so this could not be saved.');
     }
-    setSaved(true);
-    onToast('Settings saved on this device.');
-    window.setTimeout(() => setSaved(false), 2200);
   };
 
   return (
     <section className="screen settings-screen">
       <div className="screen-heading"><div><p className="eyebrow">SETTINGS</p><h1>Your private closet</h1><p className="heading-copy">Everything lives in this browser, on this device.</p></div></div>
+
       <section className="settings-card">
-        <div className="settings-card-heading"><span className="settings-icon">✦</span><div><h2>AI provider</h2><p>Used only to tag photos and make outfit suggestions.</p></div></div>
-        <div className="provider-choice" role="radiogroup" aria-label="AI provider">
-          {PROVIDER_IDS.map((id) => (
-            <button
-              key={id}
-              className={`choice-button ${providerId === id ? 'is-selected' : ''}`}
-              type="button"
-              role="radio"
-              aria-checked={providerId === id}
-              onClick={() => setProviderDraft(id)}
-            >
-              {PROVIDERS[id].label}
-            </button>
-          ))}
+        <div className="settings-card-heading">
+          <span className="settings-icon">✦</span>
+          <div><h2>AI providers</h2><p>Add any OpenAI-compatible API. Used only to tag photos and make outfit suggestions.</p></div>
         </div>
-        <label className="key-field"><span>{provider.label} API key</span><div><input type={showKey ? 'text' : 'password'} value={apiKey} placeholder={provider.keyPlaceholder} autoComplete="off" spellCheck="false" onChange={(event) => setKeys((current) => ({ ...current, [providerId]: event.target.value }))} /><button type="button" onClick={() => setShowKey((current) => !current)}>{showKey ? 'Hide' : 'Show'}</button></div></label>
-        {mismatch && mismatch !== providerId && (
-          <p className="key-warning" role="alert">
-            That looks like a {PROVIDERS[mismatch].label} key. Either switch the provider above, or paste {provider.article} {provider.label} key.
-          </p>
+
+        {providers.length === 0 && (
+          <p className="inline-note">No providers added yet. Add one below to turn on auto-tagging and AI outfit suggestions — everything else works without one.</p>
         )}
-        <p className="field-hint">Get a key from {provider.keyHost} · tags with {provider.primaryModel}, retries on {provider.fallbackModel}</p>
-        <p className="privacy-note"><span>⌁</span>Each provider's key is saved locally on this device and is sent only to {provider.label}, and only when you use a feature.</p>
+
+        {providers.length > 0 && (
+          <div className="provider-list" role="radiogroup" aria-label="Active AI provider">
+            {providers.map((item) => (
+              openFormId === item.id ? (
+                <ProviderForm
+                  key={item.id}
+                  mode="edit"
+                  initial={item}
+                  onCancel={() => setOpenFormId(null)}
+                  onSave={(changes) => {
+                    updateProvider(item.id, changes);
+                    refresh();
+                    setOpenFormId(null);
+                    onToast('Provider updated.');
+                  }}
+                  onToast={onToast}
+                />
+              ) : (
+                <div className={`provider-row ${item.id === activeId ? 'is-active' : ''}`} key={item.id}>
+                  <label className="provider-row-radio">
+                    <input type="radio" checked={item.id === activeId} onChange={() => makeActive(item.id)} />
+                    <span>
+                      <strong>{item.label}</strong>
+                      <small>{item.model || 'no model set'} · {JSON_MODE_LABELS[item.jsonMode] || item.jsonMode}</small>
+                    </span>
+                  </label>
+                  <div className="provider-row-actions">
+                    <button className="text-button" type="button" onClick={() => setOpenFormId(item.id)}>Edit</button>
+                    <button className="icon-text-button danger-text" type="button" onClick={() => removeProvider(item.id, item.label)}>Remove</button>
+                  </div>
+                </div>
+              )
+            ))}
+          </div>
+        )}
+
+        {openFormId === 'new' ? (
+          <ProviderForm
+            mode="add"
+            onCancel={() => setOpenFormId(null)}
+            onSave={(values) => {
+              addProvider(values);
+              refresh();
+              setOpenFormId(null);
+              onToast('Provider added.');
+            }}
+            onToast={onToast}
+          />
+        ) : (
+          <button className="secondary-button full-width" type="button" onClick={() => setOpenFormId('new')}>＋ Add a provider</button>
+        )}
+
+        <p className="privacy-note"><span>⌁</span>Each provider's key is saved locally on this device and is sent only to that provider, and only when you use a feature that needs it.</p>
       </section>
+
       <section className="settings-card">
         <div className="settings-card-heading"><span className="settings-icon">◷</span><div><h2>Repeat protection</h2><p>Deprioritise pieces you wore recently.</p></div></div>
-        <div className="range-setting"><label htmlFor="repeat-days">Avoid repeats for <strong>{repeatDays} days</strong></label><input id="repeat-days" type="range" min="0" max={MAX_REPEAT_DAYS} step="1" value={repeatDays} onChange={(event) => setRepeatDaysDraft(Number(event.target.value))} /><div><span>Off</span><span>3 weeks</span></div></div>
+        <div className="range-setting">
+          <label htmlFor="repeat-days">Avoid repeats for <strong>{repeatDays} days</strong></label>
+          <input id="repeat-days" type="range" min="0" max={MAX_REPEAT_DAYS} step="1" value={repeatDays} onChange={(event) => changeRepeatDays(Number(event.target.value))} />
+          <div><span>Off</span><span>3 weeks</span></div>
+        </div>
       </section>
-      <button className={`primary-button full-width ${saved ? 'success-button' : ''}`} type="button" onClick={saveSettings}>{saved ? '✓ Saved locally' : 'Save settings'}</button>
-      <section className="danger-zone"><p className="eyebrow">DEVICE DATA</p><h2>Start fresh</h2><p>This permanently removes every saved photo and wardrobe item from this browser.</p><button className="danger-button" type="button" onClick={onClear}>Clear wardrobe data</button></section>
+
+      <section className="danger-zone"><p className="eyebrow">DEVICE DATA</p><h2>Start fresh</h2><p>This permanently removes every saved photo and wardrobe item from this browser. Your providers and keys are left alone.</p><button className="danger-button" type="button" onClick={onClear}>Clear wardrobe data</button></section>
     </section>
+  );
+}
+
+const JSON_MODE_LABELS = {
+  auto: 'auto-detect',
+  schema: 'strict schema',
+  object: 'JSON object',
+  text: 'plain text',
+};
+
+/**
+ * Add/edit form for one provider. Picking a preset refills every field, since
+ * changing presets mid-edit is a deliberate reset, not a merge. "Test
+ * connection" runs against the in-progress draft, before it is saved, so a
+ * bad key or wrong base URL is caught before it becomes the active provider.
+ */
+function ProviderForm({ mode, initial, onCancel, onSave, onToast }) {
+  const startPreset = initial?.presetId || DEFAULT_PRESET_ID;
+  const [presetId, setPresetId] = useState(startPreset);
+  const [label, setLabel] = useState(initial?.label ?? getPreset(startPreset).label);
+  const [baseUrl, setBaseUrl] = useState(initial?.baseUrl ?? getPreset(startPreset).baseUrl);
+  const [apiKey, setApiKeyDraft] = useState(initial?.apiKey ?? '');
+  const [model, setModel] = useState(initial?.model ?? getPreset(startPreset).model);
+  const [fallbackModel, setFallbackModel] = useState(initial?.fallbackModel ?? getPreset(startPreset).fallbackModel);
+  const [jsonMode, setJsonMode] = useState(initial?.jsonMode ?? getPreset(startPreset).jsonMode);
+  const [taggingMaxTokens, setTaggingMaxTokens] = useState(initial?.taggingMaxTokens ?? getPreset(startPreset).taggingMaxTokens);
+  const [outfitMaxTokens, setOutfitMaxTokens] = useState(initial?.outfitMaxTokens ?? getPreset(startPreset).outfitMaxTokens);
+  const [showKey, setShowKey] = useState(false);
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [testResult, setTestResult] = useState(null);
+  const [isTesting, setIsTesting] = useState(false);
+
+  const preset = getPreset(presetId);
+  const mismatch = detectPresetFromKey(apiKey);
+  const canTest = baseUrl.trim() && apiKey.trim() && model.trim();
+
+  const applyPreset = (id) => {
+    const nextPreset = getPreset(id);
+    setPresetId(id);
+    setLabel(nextPreset.label);
+    setBaseUrl(nextPreset.baseUrl);
+    setModel(nextPreset.model);
+    setFallbackModel(nextPreset.fallbackModel);
+    setJsonMode(nextPreset.jsonMode);
+    setTaggingMaxTokens(nextPreset.taggingMaxTokens);
+    setOutfitMaxTokens(nextPreset.outfitMaxTokens);
+    setTestResult(null);
+  };
+
+  const runTest = async (withVision) => {
+    setIsTesting(true);
+    setTestResult(null);
+    try {
+      const result = await testProvider(
+        { id: initial?.id || 'draft', presetId, label: label || preset.label, baseUrl: baseUrl.trim(), apiKey: apiKey.trim(), model: model.trim(), fallbackModel, jsonMode },
+        { withVision },
+      );
+      setTestResult(result);
+    } finally {
+      setIsTesting(false);
+    }
+  };
+
+  const save = () => {
+    if (!baseUrl.trim() || !apiKey.trim() || !model.trim()) {
+      onToast('Base URL, API key and model are all required.');
+      return;
+    }
+    onSave({
+      presetId,
+      label: label.trim() || preset.label,
+      baseUrl: baseUrl.trim(),
+      apiKey: apiKey.trim(),
+      model: model.trim(),
+      fallbackModel: fallbackModel.trim(),
+      jsonMode,
+      taggingMaxTokens,
+      outfitMaxTokens,
+    });
+  };
+
+  return (
+    <div className="provider-form">
+      <label>Preset
+        <select value={presetId} onChange={(event) => applyPreset(event.target.value)}>
+          {PROVIDER_PRESETS.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}
+        </select>
+      </label>
+      <label>Name<input value={label} onChange={(event) => setLabel(event.target.value)} placeholder={preset.label} /></label>
+      <label>Base URL<input value={baseUrl} onChange={(event) => { setBaseUrl(event.target.value); setTestResult(null); }} placeholder="https://api.example.com/v1" spellCheck="false" autoComplete="off" /></label>
+      <label className="key-field">
+        <span>API key</span>
+        <div>
+          <input type={showKey ? 'text' : 'password'} value={apiKey} placeholder={preset.keyPlaceholder} autoComplete="off" spellCheck="false" onChange={(event) => { setApiKeyDraft(event.target.value); setTestResult(null); }} />
+          <button type="button" onClick={() => setShowKey((current) => !current)}>{showKey ? 'Hide' : 'Show'}</button>
+        </div>
+      </label>
+      {mismatch && mismatch !== presetId && (
+        <p className="key-warning" role="alert">
+          That looks like {getPreset(mismatch).article} {getPreset(mismatch).label} key, but this is set up as {label || preset.label}.
+        </p>
+      )}
+      {preset.keyHost && <p className="field-hint">Get a key from {preset.keyHost}</p>}
+      <label>Model<input value={model} onChange={(event) => { setModel(event.target.value); setTestResult(null); }} placeholder="model name" /></label>
+      <label>Fallback model <span className="field-hint-inline">(used if the first model fails)</span><input value={fallbackModel} onChange={(event) => setFallbackModel(event.target.value)} placeholder="optional" /></label>
+
+      <button className="text-button" type="button" onClick={() => setShowAdvanced((current) => !current)}>{showAdvanced ? 'Hide advanced' : 'Advanced'}</button>
+      {showAdvanced && (
+        <div className="provider-advanced">
+          <label>JSON response mode
+            <select value={jsonMode} onChange={(event) => setJsonMode(event.target.value)}>
+              <option value="auto">Auto-detect (recommended)</option>
+              <option value="schema">Strict schema</option>
+              <option value="object">JSON object</option>
+              <option value="text">Plain text (extract JSON)</option>
+            </select>
+          </label>
+          <p className="field-hint">Auto-detect tries strict schema first and steps down automatically if the provider rejects it, then remembers what worked.</p>
+          <label>Tagging token budget<input type="number" min="200" max="8000" step="100" value={taggingMaxTokens} onChange={(event) => setTaggingMaxTokens(Number(event.target.value) || preset.taggingMaxTokens)} /></label>
+          <label>Outfit token budget<input type="number" min="200" max="4000" step="100" value={outfitMaxTokens} onChange={(event) => setOutfitMaxTokens(Number(event.target.value) || preset.outfitMaxTokens)} /></label>
+        </div>
+      )}
+
+      <div className="provider-test-row">
+        <button className="secondary-button compact" type="button" disabled={isTesting || !canTest} onClick={() => runTest(false)}>{isTesting ? 'Testing…' : 'Test connection'}</button>
+        <button className="secondary-button compact" type="button" disabled={isTesting || !canTest} onClick={() => runTest(true)}>{isTesting ? 'Testing…' : 'Test photo tagging'}</button>
+      </div>
+      {testResult && (
+        <p className={`test-result ${testResult.ok ? 'test-ok' : 'test-bad'}`} role="status">
+          {testResult.ok
+            ? `✓ ${testResult.model} replied in ${testResult.latencyMs}ms${testResult.visionTested ? ' — it can read a photo.' : '.'}`
+            : `✕ ${testResult.message}${testResult.status ? ` (HTTP ${testResult.status})` : ''}`}
+        </p>
+      )}
+
+      <div className="provider-form-actions">
+        <button className="primary-button" type="button" onClick={save}>{mode === 'add' ? 'Add provider' : 'Save changes'}</button>
+        <button className="text-button" type="button" onClick={onCancel}>Cancel</button>
+      </div>
+    </div>
   );
 }
 

@@ -18,8 +18,19 @@ import {
 import { prepareImage } from './lib/image.js';
 import { suggestOutfit as requestOutfit, tagPhoto as requestTags } from './lib/ai.js';
 import { makeWardrobePromptItems } from './lib/outfit.js';
-import { getApiKey, getProvider } from './lib/settings.js';
+import { getActiveProvider, updateProvider } from './lib/settings.js';
 import { normalizeSeasons, normalizeWeatherSuitability, toLocalDateString } from './types.js';
+
+/**
+ * A provider set to "auto" JSON mode gets probed once, on its first real call,
+ * and whatever tier actually worked is pinned so every later call goes
+ * straight there instead of re-trying schema/object/text every single time.
+ */
+function pinResolvedJsonMode(provider, resolvedMode) {
+  if (provider?.jsonMode === 'auto' && resolvedMode && resolvedMode !== 'auto') {
+    updateProvider(provider.id, { jsonMode: resolvedMode });
+  }
+}
 
 // The model is asked to choose from a shortlist rather than the whole wardrobe,
 // which keeps the request small once a closet grows past a hundred pieces.
@@ -70,8 +81,10 @@ export async function listItems() {
 }
 
 export async function tagPhoto(file) {
-  const providerId = getProvider();
-  return requestTags(file, { apiKey: getApiKey(providerId), providerId });
+  const provider = getActiveProvider();
+  const result = await requestTags(file, { provider });
+  pinResolvedJsonMode(provider, result.jsonMode);
+  return result;
 }
 
 /**
@@ -165,20 +178,21 @@ function shortlistCandidates(items, limit) {
 }
 
 export async function suggestOutfit({ items, preferences = {}, excludedItemIds = [], avoidRecentDays = 7 }) {
-  const providerId = getProvider();
+  const provider = getActiveProvider();
   const wantedItemId = preferences.wantedItemId || '';
   const candidates = makeWardrobePromptItems(shortlistCandidates(items, MAX_CANDIDATES), avoidRecentDays);
 
-  return requestOutfit({
+  const result = await requestOutfit({
     candidates,
     preferences,
     // A re-roll must still honour a specifically requested item.
     excludedItemIds: excludedItemIds.filter((id) => id !== wantedItemId),
     avoidRecentDays,
     today: toLocalDateString(),
-    apiKey: getApiKey(providerId),
-    providerId,
+    provider,
   });
+  pinResolvedJsonMode(provider, result.jsonMode);
+  return result;
 }
 
 export const services = {

@@ -71,7 +71,6 @@ function hasStyleOverlap(item, occasion, vibe) {
  */
 export function filterWardrobeForOutfit(items, filters = {}, repeatDays = 7) {
   const { weather = "any", occasion = "casual", vibe = "", requiredItemId } = filters;
-  const hasWeatherMatches = items.some((item) => itemMatchesWeather(item, weather));
 
   return items
     .map((item) => {
@@ -82,7 +81,11 @@ export function filterWardrobeForOutfit(items, filters = {}, repeatDays = 7) {
       const score = (required ? 100 : 0) + (weatherMatch ? 16 : 0) + (styleMatch ? 8 : 0) - (recent ? 10 : 0);
       return { ...item, _outfitScore: score, _isRecent: recent, _weatherMatch: weatherMatch };
     })
-    .filter((item) => item.id === requiredItemId || !hasWeatherMatches || item._weatherMatch)
+    // Weather ranks, it never eliminates. Dropping every non-matching piece used
+    // to wipe out whole categories — tag a top "summer" then ask for a cool day
+    // and it vanished, leaving nothing to build an outfit from. The +16 score
+    // above already floats weather-appropriate pieces to the front of their
+    // category, and the prompt tells the model the weather anyway.
     .sort((a, b) => b._outfitScore - a._outfitScore || String(a.category).localeCompare(String(b.category)));
 }
 
@@ -100,7 +103,21 @@ export function makeWardrobePromptItems(items, repeatDays = 7) {
   }));
 }
 
-export function hasEnoughForSuggestion(items) {
+/**
+ * Advisory only — never gates the Outfit tab. Names what a complete outfit is
+ * still missing (e.g. no shoes yet) so the suggestion screen can say so, rather
+ * than the wardrobe silently blocking the whole feature until every category
+ * is filled in.
+ */
+export function missingForCompleteOutfit(items) {
   const categories = new Set(items.map((item) => item.category));
-  return categories.has("shoes") && (categories.has("dress") || (categories.has("top") && categories.has("bottom")));
+  const missing = [];
+
+  if (!categories.has("shoes")) missing.push("shoes");
+  if (!categories.has("dress") && !(categories.has("top") && categories.has("bottom"))) {
+    if (!categories.has("top")) missing.push("a top");
+    if (!categories.has("bottom")) missing.push("a bottom");
+  }
+
+  return missing;
 }
