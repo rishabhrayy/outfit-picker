@@ -113,14 +113,20 @@ export const PROVIDER_PRESETS = Object.freeze([
     label: 'OpenRouter',
     article: 'an',
     baseUrl: 'https://openrouter.ai/api/v1',
-    // openrouter/free auto-routes to whichever free backend is up, and has
-    // confirmed vision + structured-output support.
-    model: 'openrouter/free',
-    fallbackModel: 'openrouter/free',
-    // Generous on purpose (see the Anthropic preset's comment above) — doubly
-    // so here, since openrouter/free routes to whichever free backend is
-    // currently up, so there is no fixed model whose typical output length
-    // to tune tightly against.
+    // openrouter/free (an earlier choice here) is an auto-router, not a real
+    // model — it hands each request to whatever free backend is up at that
+    // moment, with no fixed context or output limit of its own (OpenRouter's
+    // own model listing reports its max completion length as null). That's
+    // exactly what caused live, repeated truncation. dots-3-note is a real,
+    // named, currently-free vision model with a genuinely large completion
+    // limit (460k tokens, per OpenRouter's own model listing) and confirmed
+    // structured_outputs support — the only free vision model listed there
+    // that has it, which is also why this stays pinned to "schema" below.
+    model: 'dots-studio/dots-3-note-preview:free',
+    // A different model on retry, not the same one twice — minimax/m3 is
+    // also free, vision-capable and generously sized, so a failure that
+    // wasn't just bad luck on dots-3-note has a real chance of landing here.
+    fallbackModel: 'minimax/minimax-m3:free',
     taggingMaxTokens: 3000,
     outfitMaxTokens: 1200,
     keyPlaceholder: 'sk-or-v1-…',
