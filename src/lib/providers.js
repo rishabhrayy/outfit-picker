@@ -32,8 +32,13 @@ export const PROVIDER_PRESETS = Object.freeze([
     // failure, the same shape as every other preset here.
     model: 'claude-haiku-4-5-20251001',
     fallbackModel: 'claude-sonnet-5',
-    taggingMaxTokens: 1200,
-    outfitMaxTokens: 800,
+    // Generous on purpose: max_tokens is a safety ceiling, not a target, and
+    // costs nothing extra unless actually used. A busy multi-item outfit
+    // photo's tagging JSON, or verbose tool-call arguments, can run well past
+    // a tight budget — confirmed live on two other providers before this one
+    // shipped, so this is sized to not repeat that rather than wait for it.
+    taggingMaxTokens: 3000,
+    outfitMaxTokens: 1200,
     keyPlaceholder: 'sk-ant-…',
     keyHost: 'platform.claude.com/settings/keys',
     keyPrefixes: ['sk-ant-'],
@@ -50,8 +55,10 @@ export const PROVIDER_PRESETS = Object.freeze([
     // The smaller model tags first; the larger one gets a retry when it fails.
     model: 'gpt-4o-mini',
     fallbackModel: 'gpt-4o',
-    taggingMaxTokens: 1200,
-    outfitMaxTokens: 500,
+    // See the comment on the Anthropic preset above — generous on purpose,
+    // a ceiling costs nothing unless actually used.
+    taggingMaxTokens: 3000,
+    outfitMaxTokens: 1200,
     keyPlaceholder: 'sk-…',
     keyHost: 'platform.openai.com/api-keys',
     keyPrefixes: ['sk-'],
@@ -94,7 +101,7 @@ export const PROVIDER_PRESETS = Object.freeze([
     // are sized for it, since reasoning can spend real tokens before
     // answering (the same failure mode found with Gemini's 3.x models).
     fallbackModel: 'qwen/qwen3.8-27b',
-    taggingMaxTokens: 2000,
+    taggingMaxTokens: 3000,
     outfitMaxTokens: 1200,
     keyPlaceholder: 'gsk_…',
     keyHost: 'console.groq.com/keys',
@@ -110,8 +117,12 @@ export const PROVIDER_PRESETS = Object.freeze([
     // confirmed vision + structured-output support.
     model: 'openrouter/free',
     fallbackModel: 'openrouter/free',
-    taggingMaxTokens: 1500,
-    outfitMaxTokens: 800,
+    // Generous on purpose (see the Anthropic preset's comment above) — doubly
+    // so here, since openrouter/free routes to whichever free backend is
+    // currently up, so there is no fixed model whose typical output length
+    // to tune tightly against.
+    taggingMaxTokens: 3000,
+    outfitMaxTokens: 1200,
     keyPlaceholder: 'sk-or-v1-…',
     keyHost: 'openrouter.ai/keys',
     keyPrefixes: ['sk-or-'],
@@ -124,8 +135,8 @@ export const PROVIDER_PRESETS = Object.freeze([
     baseUrl: 'https://api.mistral.ai/v1',
     model: 'pixtral-12b-2409',
     fallbackModel: 'pixtral-large-latest',
-    taggingMaxTokens: 1200,
-    outfitMaxTokens: 800,
+    taggingMaxTokens: 3000,
+    outfitMaxTokens: 1200,
     keyPlaceholder: 'paste your Mistral API key',
     keyHost: 'console.mistral.ai/api-keys',
     keyPrefixes: [],
@@ -138,8 +149,8 @@ export const PROVIDER_PRESETS = Object.freeze([
     baseUrl: 'https://api.together.xyz/v1',
     model: 'meta-llama/Llama-4-Scout-17B-16E-Instruct',
     fallbackModel: 'meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8',
-    taggingMaxTokens: 1200,
-    outfitMaxTokens: 800,
+    taggingMaxTokens: 3000,
+    outfitMaxTokens: 1200,
     keyPlaceholder: 'paste your Together API key',
     keyHost: 'api.together.ai/settings/api-keys',
     keyPrefixes: [],
@@ -154,8 +165,8 @@ export const PROVIDER_PRESETS = Object.freeze([
     // tagging will fail there even though outfit suggestions work fine.
     model: 'deepseek-chat',
     fallbackModel: 'deepseek-chat',
-    taggingMaxTokens: 1200,
-    outfitMaxTokens: 800,
+    taggingMaxTokens: 3000,
+    outfitMaxTokens: 1200,
     keyPlaceholder: 'sk-…',
     keyHost: 'platform.deepseek.com/api_keys',
     keyPrefixes: ['sk-'],
@@ -168,8 +179,8 @@ export const PROVIDER_PRESETS = Object.freeze([
     baseUrl: 'https://api.x.ai/v1',
     model: 'grok-4-fast',
     fallbackModel: 'grok-4',
-    taggingMaxTokens: 1200,
-    outfitMaxTokens: 800,
+    taggingMaxTokens: 3000,
+    outfitMaxTokens: 1200,
     keyPlaceholder: 'xai-…',
     keyHost: 'console.x.ai',
     keyPrefixes: ['xai-'],
@@ -182,8 +193,8 @@ export const PROVIDER_PRESETS = Object.freeze([
     baseUrl: '',
     model: '',
     fallbackModel: '',
-    taggingMaxTokens: 1500,
-    outfitMaxTokens: 800,
+    taggingMaxTokens: 3000,
+    outfitMaxTokens: 1200,
     keyPlaceholder: 'paste your API key',
     keyHost: '',
     keyPrefixes: [],
