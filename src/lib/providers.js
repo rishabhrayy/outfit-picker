@@ -81,13 +81,21 @@ export const PROVIDER_PRESETS = Object.freeze([
     label: 'Groq',
     article: 'a',
     baseUrl: 'https://api.groq.com/openai/v1',
-    // Groq's strict json_schema support is documented only for its text-only
-    // models (GPT-OSS, Qwen), not its vision models, so this starts in the
-    // looser json_object mode rather than probing schema first and failing.
-    model: 'meta-llama/llama-4-scout-17b-16e-instruct',
-    fallbackModel: 'meta-llama/llama-4-maverick-17b-128e-instruct',
-    taggingMaxTokens: 1200,
-    outfitMaxTokens: 800,
+    // Per Groq's vision docs, its only current vision-capable production
+    // models are the Qwen 3.6/3.8 27B pair (the earlier Llama 4 Scout/
+    // Maverick vision models this preset used before have been removed from
+    // Groq's catalog — confirmed by a live 404 on a real account). Their
+    // structured-output support is "JSON mode" (json_object), not a
+    // documented strict schema, so this starts one tier down rather than
+    // probing schema first and failing every time.
+    model: 'qwen/qwen3.6-27b',
+    // 3.8 adds an optional reasoning mode over 3.6, so it's kept as the
+    // escalation on failure rather than the default — and both budgets below
+    // are sized for it, since reasoning can spend real tokens before
+    // answering (the same failure mode found with Gemini's 3.x models).
+    fallbackModel: 'qwen/qwen3.8-27b',
+    taggingMaxTokens: 2000,
+    outfitMaxTokens: 1200,
     keyPlaceholder: 'gsk_…',
     keyHost: 'console.groq.com/keys',
     keyPrefixes: ['gsk_'],

@@ -21,7 +21,7 @@ Settings manages a list of providers rather than one fixed choice: add one from 
 | Anthropic (Claude) | `claude-haiku-4-5-20251001` | `claude-sonnet-5` | platform.claude.com/settings/keys |
 | OpenAI | `gpt-4o-mini` | `gpt-4o` | platform.openai.com/api-keys |
 | Google Gemini | `gemini-3.6-flash` | `gemini-3.8-flash` | aistudio.google.com/apikey |
-| Groq | Llama 4 Scout | Llama 4 Maverick | console.groq.com/keys |
+| Groq | Qwen 3.6 27B | Qwen 3.8 27B | console.groq.com/keys |
 | OpenRouter | `openrouter/free` | — | openrouter.ai/keys |
 | Mistral, Together AI, DeepSeek, xAI | see each preset in Settings | | |
 
