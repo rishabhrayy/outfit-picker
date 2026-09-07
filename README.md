@@ -10,24 +10,26 @@ It is a Progressive Web App (PWA), so a deployed copy can be installed on a phon
 - Tags one garment or several visible garments from a casual photo, then lets you review and edit the batch before saving.
 - Keeps category, colours, style, season/weather, notes, source-photo, and last-worn information for each item.
 - Filters the local wardrobe before requesting an outfit, gives recently worn items a lower priority, and lets you mark a suggestion as worn.
-- Works with either OpenAI or Google Gemini, chosen in Settings.
+- Works with any OpenAI-compatible AI provider — add as many as you like in Settings and switch between them.
 
 ### Choosing a provider
 
-Settings has a provider switch. Google publishes an OpenAI-compatible endpoint, so both take the same request shape and the app only changes the base URL, the model names, and the token budget.
+Settings manages a list of providers rather than one fixed choice: add one from a preset (base URL, a sensible model, and how it returns structured JSON all prefilled) or add a **Custom** one by hand with any base URL, model, and key. Whichever is marked active is the one tagging and outfit suggestions use. A key is stored separately per provider, so switching back and forth never means pasting a key in again, and the app only ever sends a key to the provider it belongs to.
 
-| | OpenAI | Google Gemini |
-| --- | --- | --- |
-| Tags with | `gpt-4o-mini` | `gemini-3.6-flash` |
-| Retries on | `gpt-4o` | `gemini-3.8-flash` |
-| Get a key at | platform.openai.com/api-keys | aistudio.google.com/apikey |
-| Cost | Paid; needs credit on the account | Has a free tier |
+| Preset | Tags with | Retries on | Get a key at |
+| --- | --- | --- | --- |
+| Anthropic (Claude) | `claude-haiku-4-5-20251001` | `claude-sonnet-5` | platform.claude.com/settings/keys |
+| OpenAI | `gpt-4o-mini` | `gpt-4o` | platform.openai.com/api-keys |
+| Google Gemini | `gemini-3.6-flash` | `gemini-3.8-flash` | aistudio.google.com/apikey |
+| Groq | Llama 4 Scout | Llama 4 Maverick | console.groq.com/keys |
+| OpenRouter | `openrouter/free` | — | openrouter.ai/keys |
+| Mistral, Together AI, DeepSeek, xAI | see each preset in Settings | | |
 
-A key is stored separately per provider, so switching back and forth does not mean pasting a key in again. The app only ever sends a key to the provider it belongs to.
+Providers vary in how reliably they return the exact JSON shape the app asks for, so each one is tried at the best tier it actually supports, in order: a strict schema (`response_format: json_schema`), a forced tool call, a plain JSON-object request, then a plain-text request with the JSON pulled out of the reply by hand. "Auto-detect" (the default for a new or Custom provider) starts at the top and steps down automatically the first time it's used, then remembers what worked so later calls skip straight to it. A preset with a documented quirk is pinned directly to the tier that actually works for it — Anthropic's OpenAI-compatible endpoint silently ignores `response_format` entirely, for instance, so its preset is pinned to forced tool-calling rather than wasting a call finding that out. Advanced settings on each provider can also override this by hand.
 
-Two differences worth knowing. On OpenAI the retry escalates to a genuinely larger model; on Gemini the pro tier answers `429` on a standard key, so the retry goes to a newer flash model of the same class instead. And Gemini 3.x models reason before answering, spending roughly 500 tokens before writing anything, so the app gives Gemini a much larger `max_tokens` budget — too small a budget returns an empty reply with `finish_reason: "length"`.
+Two other differences worth knowing. On several presets the retry escalates to a genuinely stronger model; on Gemini the pro tier answers `429` on a standard key, so the retry goes to a newer flash model of the same class instead, and Gemini 3.x models reason before answering, spending roughly 500 tokens before writing anything, so the app gives Gemini a much larger `max_tokens` budget than most other presets — too small a budget returns an empty reply with `finish_reason: "length"`. And Anthropic's API refuses direct browser requests unless a request carries `anthropic-dangerous-direct-browser-access: true` — Anthropic's own documented opt-in for exactly this kind of bring-your-own-key client-side app; the app adds it automatically for any provider whose base URL points at `api.anthropic.com`, including a hand-added Custom one.
 
-If a key is pasted while the wrong provider is selected, the app says so directly rather than reporting a rejected key, both in Settings and on the failed request.
+If a key is pasted that looks like it belongs to a different provider than the one selected, the app says so directly rather than reporting a rejected key, both in Settings and on the failed request. Use **Test connection** (and **Test photo tagging**, which also checks vision support) on a provider before relying on it — it reports the provider's exact status and error text without spending a real photo upload.
 
 ### Photos, items, and crops
 
@@ -46,7 +48,7 @@ The key is only needed for the two AI features. Without one you can still add ph
 ## Requirements
 
 - A current Node.js LTS release (Node 20 or newer is recommended) and npm.
-- An API key from either OpenAI or Google Gemini for the optional AI features. Tagging and outfit suggestions need an internet connection; viewing your already saved wardrobe does not.
+- An API key from any supported provider for the optional AI features (see [Choosing a provider](#choosing-a-provider)). Tagging and outfit suggestions need an internet connection; viewing your already saved wardrobe does not.
 
 ## Run locally
 
@@ -71,16 +73,16 @@ The production files are written to `dist`.
 
 ## Add an API key
 
-1. Create a personal API key with your chosen provider: the [OpenAI API dashboard](https://platform.openai.com/api-keys) or [Google AI Studio](https://aistudio.google.com/apikey).
-2. Open Outfit Picker and go to **Settings**.
-3. Pick the matching provider, paste the key into the key field, and save.
+1. Create a personal API key with your chosen provider (see the table above for where).
+2. Open Outfit Picker, go to **Settings**, and select **＋ Add a provider**.
+3. Pick a preset (or **Custom** for anything not listed), paste the key into the key field, and save. The first provider you add becomes active automatically.
 4. Upload a photo or request an outfit. The app uses the key only when it makes a request.
 
 The app begins photo tagging with the selected provider's smaller model. If the returned tags are incomplete or malformed, it retries that photo once on the stronger model. Outfit selection is based on structured local item data, not a second upload of the clothing photos.
 
 ### Important API-key security trade-off
 
-This project deliberately follows a bring-your-own-key, browser-only design: the key is kept in this browser's `localStorage` and calls the provider directly. That matches the no-backend, one-person scope, but it is **not a secure pattern for a public or multi-user web app**. Both providers advise against exposing an API key in browser or app client code; a production shared app should keep its key on a server-side service instead. See OpenAI's [API authentication guidance](https://developers.openai.com/api/reference/overview) and Google's [API key guidance](https://ai.google.dev/gemini-api/docs/api-key).
+This project deliberately follows a bring-your-own-key, browser-only design: each key is kept in this browser's `localStorage` and calls its provider directly. That matches the no-backend, one-person scope, but it is **not a secure pattern for a public or multi-user web app**. Every provider here advises against exposing an API key in browser or app client code; a production shared app should keep its key on a server-side service instead. See [OpenAI's](https://developers.openai.com/api/reference/overview), [Google's](https://ai.google.dev/gemini-api/docs/api-key), and [Anthropic's](https://platform.claude.com/docs/en/api/overview) guidance.
 
 Use this only on a device and browser profile you control. Someone with access to the unlocked browser profile, or malicious code running on the same site, could retrieve the key and spend against your account. Do not put a key in source code, a `.env` file committed to Git, Vercel/Netlify public variables, screenshots, a shared link, or a chat message. Prefer a dedicated key with a conservative budget and alerts, and revoke it in the provider's dashboard if you think it has been exposed.
 

@@ -1682,6 +1682,7 @@ function SettingsView({ onClear, onToast }) {
 const JSON_MODE_LABELS = {
   auto: 'auto-detect',
   schema: 'strict schema',
+  tools: 'tool calling',
   object: 'JSON object',
   text: 'plain text',
 };
@@ -1789,6 +1790,7 @@ function ProviderForm({ mode, initial, onCancel, onSave, onToast }) {
             <select value={jsonMode} onChange={(event) => setJsonMode(event.target.value)}>
               <option value="auto">Auto-detect (recommended)</option>
               <option value="schema">Strict schema</option>
+              <option value="tools">Tool calling</option>
               <option value="object">JSON object</option>
               <option value="text">Plain text (extract JSON)</option>
             </select>

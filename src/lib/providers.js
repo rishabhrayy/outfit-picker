@@ -4,18 +4,44 @@
  * These are NOT the runtime provider config any more — the app supports an
  * arbitrary list of user-added providers, stored by lib/settings.js. A preset
  * only prefills the add-provider form (base URL, model, token budgets) for
- * eight providers known to publish an OpenAI-compatible chat/completions
+ * nine providers known to publish an OpenAI-compatible chat/completions
  * endpoint. Picking "Custom" in that form leaves every field blank instead.
  *
  * Every preset here was checked from the deployed origin: a POST with a
  * deliberately invalid key returned a JSON error body rather than a CORS
  * failure, which is what makes a browser-only app viable against it at all.
  * Cerebras was tested and excluded — it blocks the browser outright.
+ * Anthropic needed one extra header to pass that same check — see
+ * ANTHROPIC_BROWSER_HOST in lib/ai.js.
  */
 
 export const DEFAULT_PRESET_ID = 'openai';
 
 export const PROVIDER_PRESETS = Object.freeze([
+  Object.freeze({
+    id: 'anthropic',
+    label: 'Anthropic (Claude)',
+    article: 'an',
+    // Anthropic's OpenAI-compatible endpoint. Calling it from a browser needs
+    // one extra header beyond the usual Bearer key — lib/ai.js adds it
+    // automatically for any base URL on this host, matching Anthropic's own
+    // documented opt-in for bring-your-own-key client-side apps.
+    baseUrl: 'https://api.anthropic.com/v1',
+    // Fast and inexpensive, with vision support — a sensible default for a
+    // wardrobe-photo-tagging workload. Escalates to a stronger model on
+    // failure, the same shape as every other preset here.
+    model: 'claude-haiku-4-5-20251001',
+    fallbackModel: 'claude-sonnet-5',
+    taggingMaxTokens: 1200,
+    outfitMaxTokens: 800,
+    keyPlaceholder: 'sk-ant-…',
+    keyHost: 'platform.claude.com/settings/keys',
+    keyPrefixes: ['sk-ant-'],
+    // response_format is silently ignored on this endpoint — schema/object
+    // modes would look configured but never actually constrain anything.
+    // Forced tool-calling is what Anthropic's docs list as fully supported.
+    jsonMode: 'tools',
+  }),
   Object.freeze({
     id: 'openai',
     label: 'OpenAI',

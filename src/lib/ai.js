@@ -2,17 +2,25 @@
  * Direct browser calls to whichever AI provider is active in Settings.
  * Nothing is proxied through a server, because this app has none.
  *
- * Providers vary in how they'll return structured JSON. Three tiers are tried,
+ * Providers vary in how they'll return structured JSON. Four tiers are tried,
  * in order, the first time a provider is used:
  *   1. schema — response_format: json_schema, strict. Best, not universal.
- *   2. object — response_format: json_object, with the shape spelled out in
+ *   2. tools  — a forced function/tool call whose parameters are the schema.
+ *      Widely supported even where response_format is not (Anthropic's
+ *      OpenAI-compatible endpoint silently ignores response_format entirely,
+ *      but tool_choice-forced calls are a documented, fully supported path).
+ *   3. object — response_format: json_object, with the shape spelled out in
  *      the prompt instead of enforced.
- *   3. text   — no response_format at all; the shape is only in the prompt,
+ *   4. text   — no response_format at all; the shape is only in the prompt,
  *      and the first balanced {...} in the reply is extracted by hand.
  * A provider set to "auto" starts at (1) and steps down on a 4xx that looks
- * like an unsupported-response-format error. Once a tier works, the caller
- * persists it on the provider record, so later calls go straight there
- * instead of re-probing every time.
+ * like an unsupported-response-format error, or on a "tools" reply that came
+ * back without a tool call at all. Once a tier works, the caller persists it
+ * on the provider record, so later calls go straight there instead of
+ * re-probing every time.
+ *
+ * Anthropic also needs one extra header for a browser to call it directly —
+ * see ANTHROPIC_BROWSER_HOST below.
  */
 
 import { detectPresetFromKey, getPreset } from './providers.js';
@@ -22,6 +30,14 @@ import { prepareImage } from './image.js';
 // Vision calls on a reasoning model routinely take 7-10s; this is the point at
 // which the request is considered hung rather than slow.
 const REQUEST_TIMEOUT_MS = 90_000;
+
+// Anthropic's API refuses direct browser requests by default — this header is
+// its documented, sanctioned opt-in specifically for bring-your-own-key
+// client-side apps like this one (a webapp storing a user's own key and
+// calling Anthropic directly, never proxied through a server). Matched on
+// host, not a per-provider flag, so a hand-typed Custom provider pointed at
+// the same host still works without the user needing to know this exists.
+const ANTHROPIC_BROWSER_HOST = 'api.anthropic.com';
 
 const CATEGORY_ENUM = ['top', 'bottom', 'dress', 'outerwear', 'shoes', 'accessory'];
 const SEASON_ENUM = ['spring', 'summer', 'autumn', 'winter', 'all-season'];
@@ -236,13 +252,18 @@ async function requestOnce({ provider, body, signal }) {
 
   let response;
   try {
+    const headers = {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${provider.apiKey}`,
+    };
+    if (provider.baseUrl?.includes(ANTHROPIC_BROWSER_HOST)) {
+      headers['anthropic-dangerous-direct-browser-access'] = 'true';
+    }
+
     response = await fetch(`${provider.baseUrl}/chat/completions`, {
       method: 'POST',
       signal: controller.signal,
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${provider.apiKey}`,
-      },
+      headers,
       body: JSON.stringify(body),
     });
   } catch (error) {
@@ -284,7 +305,10 @@ async function requestOnce({ provider, body, signal }) {
     throw error;
   }
 
-  return choice?.message?.content ?? '';
+  return {
+    content: choice?.message?.content ?? '',
+    toolArguments: choice?.message?.tool_calls?.[0]?.function?.arguments ?? null,
+  };
 }
 
 /**
@@ -313,6 +337,26 @@ function buildRequestBody(mode, model, messages, schemaWrapper, maxTokens) {
 
   if (mode === 'schema') {
     return { ...base, messages, response_format: { type: 'json_schema', json_schema: schemaWrapper } };
+  }
+
+  if (mode === 'tools') {
+    // A forced function call whose parameters ARE the schema. Supported far
+    // more widely than response_format — notably, Anthropic's
+    // OpenAI-compatible endpoint silently ignores response_format outright
+    // but fully supports this.
+    return {
+      ...base,
+      messages,
+      tools: [{
+        type: 'function',
+        function: {
+          name: schemaWrapper.name,
+          description: `Return ${schemaWrapper.name.replace(/_/g, ' ')}.`,
+          parameters: schemaWrapper.schema,
+        },
+      }],
+      tool_choice: { type: 'function', function: { name: schemaWrapper.name } },
+    };
   }
 
   const augmented = withJsonInstructions(messages, schemaWrapper);
@@ -385,7 +429,7 @@ function extractFirstJsonObject(text) {
  */
 async function callChatJson({ provider, model, messages, schema, maxTokens, signal }) {
   const pinned = provider.jsonMode && provider.jsonMode !== 'auto' ? provider.jsonMode : null;
-  const modes = pinned ? [pinned] : ['schema', 'object', 'text'];
+  const modes = pinned ? [pinned] : ['schema', 'tools', 'object', 'text'];
   let lastError;
 
   for (let index = 0; index < modes.length; index += 1) {
@@ -393,7 +437,17 @@ async function callChatJson({ provider, model, messages, schema, maxTokens, sign
     const body = buildRequestBody(mode, model, messages, schema, maxTokens);
 
     try {
-      const content = await requestOnce({ provider, body, signal });
+      const { content, toolArguments } = await requestOnce({ provider, body, signal });
+
+      if (mode === 'tools') {
+        if (!toolArguments) {
+          // The provider answered but ignored the forced tool_choice — not an
+          // HTTP error, but just as unusable, so it steps down the same way.
+          throw new SyntaxError('No tool call was returned.');
+        }
+        return { data: JSON.parse(toolArguments), jsonMode: mode };
+      }
+
       const data = mode === 'schema' ? JSON.parse(content) : extractFirstJsonObject(content);
       return { data, jsonMode: mode };
     } catch (error) {
@@ -600,7 +654,7 @@ export async function testProvider(provider, { withVision = false } = {}) {
       }]
       : [{ role: 'user', content: 'Reply with the single word OK.' }];
 
-    const content = await requestOnce({
+    const { content } = await requestOnce({
       provider,
       body: { model: provider.model, messages, max_tokens: 20, temperature: 0 },
     });
