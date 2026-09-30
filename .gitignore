@@ -34,3 +34,7 @@ work/
 .env
 .env.*
 !.env.example
+
+# Local tool config
+.claude/
+.vscode/
