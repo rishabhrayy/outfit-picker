@@ -266,6 +266,10 @@ function CropControls({ crop, onChange, idPrefix }) {
   );
 }
 
+const plural = (count, word) => `${count} ${word}${count === 1 ? '' : 's'}`;
+const describeCounts = ({ items, photos, outfits }) =>
+  `${plural(items, 'item')}, ${plural(photos, 'photo')} and ${plural(outfits, 'outfit')}`;
+
 /**
  * Main presentational app shell.
  *
@@ -279,6 +283,8 @@ function CropControls({ crop, onChange, idPrefix }) {
  *   Promise<{ itemIds: string[], explanation: string }>
  * - markItemsWorn(ids, date): Promise<void>
  * - clearWardrobe(): Promise<void>
+ * - exportBackup(): Promise<{ blob: Blob, fileName: string, counts: object }>
+ * - importBackup(file): Promise<{ items: number, photos: number, outfits: number, skipped: number }>
  */
 export default function App({ services = EMPTY_SERVICES, initialItems = [], reloadKey = 0 }) {
   const [items, setItems] = useState(() => initialItems.map(normalizeItem));
@@ -297,6 +303,8 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
   // The ids a manually built outfit is being saved from, or null when the
   // save-a-look modal is closed.
   const [buildingItemIds, setBuildingItemIds] = useState(null);
+  // Bumped after a restore so the wardrobe and journal re-read storage
+  const [restoredAt, setRestoredAt] = useState(0);
 
   /**
    * Switches tabs and always drops any in-progress wardrobe selection, so a
@@ -328,7 +336,7 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
         if (isCurrent) setIsLoading(false);
       });
     return () => { isCurrent = false; };
-  }, [services, reloadKey]);
+  }, [services, reloadKey, restoredAt]);
 
   useEffect(() => {
     let isCurrent = true;
@@ -342,7 +350,7 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
         // here should not interrupt anything else the app is doing.
       });
     return () => { isCurrent = false; };
-  }, [services, reloadKey]);
+  }, [services, reloadKey, restoredAt]);
 
   // One object URL per PHOTO, not per item: a full-outfit shot backs several
   // items, and a bulk upload multiplies that. Keying by photo also means editing
@@ -430,6 +438,33 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
       setToast('Your wardrobe has been cleared.');
     } catch (error) {
       setToast(error?.message || 'Your wardrobe could not be cleared.');
+    }
+  };
+
+  const backupWardrobe = async () => {
+    try {
+      const { blob, fileName, counts } = await services.exportBackup();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = fileName;
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setToast(`Backup saved: ${describeCounts(counts)}.`);
+    } catch (error) {
+      setToast(error?.message || 'The backup could not be made.');
+    }
+  };
+
+  const restoreWardrobe = async (file) => {
+    if (!file) return;
+    try {
+      const counts = await services.importBackup(file);
+      setRestoredAt(Date.now());
+      const skipped = counts.skipped ? ` ${plural(counts.skipped, 'item')} without a photo skipped.` : '';
+      setToast(`Restored ${describeCounts(counts)}.${skipped}`);
+    } catch (error) {
+      setToast(error?.message || 'That backup could not be restored.');
     }
   };
 
@@ -572,7 +607,7 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
           />
         )}
         {activeTab === 'settings' && (
-          <SettingsView onClear={clearWardrobe} onToast={setToast} />
+          <SettingsView onClear={clearWardrobe} onBackup={backupWardrobe} onRestore={restoreWardrobe} onToast={setToast} />
         )}
       </main>
 
@@ -1565,7 +1600,7 @@ function SaveLookModal({ items, blobUrls, itemIds, onClose, onSave }) {
   );
 }
 
-function SettingsView({ onClear, onToast }) {
+function SettingsView({ onClear, onBackup, onRestore, onToast }) {
   const [providers, setProviders] = useState(getProviders);
   const [activeId, setActiveId] = useState(getActiveProviderId);
   // null = nothing open, 'new' = the add-provider form, or a provider id being edited.
@@ -1671,6 +1706,17 @@ function SettingsView({ onClear, onToast }) {
           <label htmlFor="repeat-days">Avoid repeats for <strong>{repeatDays} days</strong></label>
           <input id="repeat-days" type="range" min="0" max={MAX_REPEAT_DAYS} step="1" value={repeatDays} onChange={(event) => changeRepeatDays(Number(event.target.value))} />
           <div><span>Off</span><span>3 weeks</span></div>
+        </div>
+      </section>
+
+      <section className="settings-card">
+        <div className="settings-card-heading"><span className="settings-icon">⇩</span><div><h2>Backup</h2><p>Your wardrobe lives only in this browser. Save a backup file now and then, and restore it here or on another device. Keys are never included.</p></div></div>
+        <div className="backup-actions">
+          <button className="secondary-button" type="button" onClick={onBackup}>Download backup</button>
+          <label className="secondary-button">
+            Restore from a backup
+            <input className="visually-hidden" type="file" accept="application/json,.json" onChange={(event) => { onRestore(event.target.files?.[0]); event.target.value = ''; }} />
+          </label>
         </div>
       </section>
 

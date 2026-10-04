@@ -520,3 +520,42 @@ export async function clearAll() {
     ]);
   });
 }
+
+const ALL_STORES = [PHOTO_STORE, ITEM_STORE, OUTFIT_STORE];
+
+/**
+ * Every photo (with its Blob), item and outfit record, read in one transaction
+ * so a backup is a consistent snapshot.
+ */
+export async function readAll() {
+  return withTransaction(ALL_STORES, 'readonly', async (transaction) => {
+    const [photos, items, outfits] = await Promise.all(
+      ALL_STORES.map((name) => requestToPromise(transaction.objectStore(name).getAll())),
+    );
+    return {
+      photos: photos.map((photo) => normalizePhotoRecord(photo)),
+      items: items.map((item) => normalizeWardrobeItem(item)),
+      outfits: outfits.map((outfit) => normalizeOutfitRecord(outfit)),
+    };
+  });
+}
+
+/**
+ * Writes restored records in one transaction: all of it lands, or none of it.
+ * A record with the same id as an existing one replaces it, so restoring the
+ * same backup twice never duplicates anything.
+ */
+export async function writeAll({ photos = [], items = [], outfits = [] } = {}) {
+  const records = [
+    [PHOTO_STORE, photos.map((photo) => normalizePhotoRecord(photo))],
+    [ITEM_STORE, items.map((item) => normalizeSavedItem(item))],
+    [OUTFIT_STORE, outfits.map((outfit) => normalizeOutfitRecord(outfit))],
+  ];
+
+  return withTransaction(ALL_STORES, 'readwrite', async (transaction) => {
+    await Promise.all(
+      records.flatMap(([name, values]) => values.map((value) => requestToPromise(transaction.objectStore(name).put(value)))),
+    );
+    return { photos: records[0][1].length, items: records[1][1].length, outfits: records[2][1].length };
+  });
+}

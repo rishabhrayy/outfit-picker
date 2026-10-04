@@ -360,3 +360,7 @@ button { -webkit-tap-highlight-color: transparent; }
   .weather-grid { grid-template-columns: repeat(2, 1fr); }
   .review-actions { margin-right: -16px; }
 }
+
+.backup-actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; margin-top: 16px; }
+.backup-actions .secondary-button { position: relative; display: inline-flex; align-items: center; justify-content: center; text-align: center; }
+.backup-actions label.secondary-button:focus-within { outline: 3px solid #7fa5ff; outline-offset: 2px; }

@@ -20,6 +20,7 @@ import {
   updateItem as updateStoredItem,
   updateOutfitRecord as updateStoredOutfitRecord,
 } from './lib/db.js';
+import { backupFileName, createBackup, parseBackup, restoreBackup } from './lib/backup.js';
 import { prepareImage } from './lib/image.js';
 import { suggestOutfit as requestOutfit, tagPhoto as requestTags } from './lib/ai.js';
 import { makeWardrobePromptItems } from './lib/outfit.js';
@@ -209,6 +210,21 @@ export async function clearWardrobe() {
   await clearAll();
 }
 
+/** The whole wardrobe as a downloadable JSON file. API keys are never included. */
+export async function exportBackup() {
+  const backup = await createBackup();
+  return {
+    blob: new Blob([JSON.stringify(backup)], { type: 'application/json' }),
+    fileName: backupFileName(),
+    counts: { items: backup.items.length, photos: backup.photos.length, outfits: backup.outfits.length },
+  };
+}
+
+/** Restores a backup file on top of the current wardrobe; nothing already here is deleted. */
+export async function importBackup(file) {
+  return restoreBackup(parseBackup(await file.text()));
+}
+
 /**
  * Trims a ranked wardrobe to the shortlist that gets sent for styling.
  *
@@ -277,6 +293,8 @@ export const services = {
   deleteOutfitRecord,
   bulkUpdateItems,
   clearWardrobe,
+  exportBackup,
+  importBackup,
   suggestOutfit,
 };
 

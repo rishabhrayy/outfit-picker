@@ -1,5 +1,7 @@
 # Outfit Picker
 
+[![CI](https://github.com/rishabhrayy/outfit-picker/actions/workflows/ci.yml/badge.svg)](https://github.com/rishabhrayy/outfit-picker/actions/workflows/ci.yml) [![Live](https://img.shields.io/badge/live-outfit.rishabhray.me-7fa5ff)](https://outfit.rishabhray.me) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Outfit Picker is a private, single-person wardrobe app that runs entirely in the browser. Add photos of your clothes, review the automatically suggested tags, browse your wardrobe, and ask for an outfit based on the occasion, weather, vibe, and an item you want to wear.
 
 It is a Progressive Web App (PWA), so a deployed copy can be installed on a phone home screen and opened like an app. There are no accounts, servers, or cloud sync.
@@ -10,6 +12,7 @@ It is a Progressive Web App (PWA), so a deployed copy can be installed on a phon
 - Tags one garment or several visible garments from a casual photo, then lets you review and edit the batch before saving.
 - Keeps category, colours, style, season/weather, notes, source-photo, and last-worn information for each item.
 - Filters the local wardrobe before requesting an outfit, gives recently worn items a lower priority, and lets you mark a suggestion as worn.
+- Backs the whole wardrobe up to one file and restores it, here or on another device (see [Backup and restore](#backup-and-restore)).
 - Works with any OpenAI-compatible AI provider — add as many as you like in Settings and switch between them.
 
 ### Choosing a provider
@@ -88,12 +91,29 @@ Use this only on a device and browser profile you control. Someone with access t
 
 ## Privacy and local data
 
-- Wardrobe items and image blobs stay in IndexedDB for the browser profile where they were added. There is no account, backend database, cloud backup, or cross-device sync.
+- Wardrobe items and image blobs stay in IndexedDB for the browser profile where they were added. There is no account, backend database, or cloud sync; moving a wardrobe between devices is a backup file you control.
 - Saved API keys live separately in `localStorage`, one per provider; they are not bundled into the deployed app.
 - When auto-tagging, the selected image is sent to the chosen provider. When suggesting an outfit, the app sends the relevant item metadata and last-worn dates, rather than re-sending the item images.
 - **Clear wardrobe data** permanently removes the local wardrobe records and their stored photo blobs. It leaves your saved keys alone. Clearing browser/site data removes the wardrobe and the keys.
 
-Keep a copy of original photos elsewhere if they matter to you. Browser storage can be cleared by browser settings, private-browsing behavior, device cleanup tools, or a profile reset.
+Browser storage can be cleared by browser settings, private-browsing behaviour, device cleanup tools, or a profile reset, so download a backup now and then.
+
+## Backup and restore
+
+**Settings > Backup** saves everything (items, outfits and journal, and every photo) to a single `outfit-picker-backup-YYYY-MM-DD.json` file. **Restore from a backup** loads one back:
+
+- **Nothing is deleted.** Records are matched by id: ones in the file replace their copies here, and everything else stays, so restoring the same file twice changes nothing.
+- **All or nothing.** The restore is one IndexedDB transaction, so a failure part-way leaves the wardrobe exactly as it was.
+- **Keys are never included.** They live in `localStorage`, which the backup never reads, so a backup file is safe to keep in cloud storage.
+- **A bad file gets a plain reason**: not JSON, not a backup, made by a newer version, or damaged.
+
+## Tests
+
+```bash
+npm test
+```
+
+17 tests (Vitest, with `fake-indexeddb` standing in for the browser): the backup round-trips photo bytes exactly, restores by id without duplicating or deleting, skips items whose photo is missing, never contains a key, and rejects bad files; the outfit logic ranks by weather without dropping a category, always keeps a requested item, and never pairs a dress with separates; and key detection picks the longest matching prefix. CI runs them and a production build on every push.
 
 ## Install it as an app
 
@@ -149,3 +169,6 @@ The current manifest uses `/` as its start URL, so deploy it at the root of a do
 - `public/` — app icons: `icon.svg`, `icon-192.png`, `icon-512.png`, `icon-maskable-512.png`, and `apple-touch-icon.png` for iOS.
 - `vite.config.js` — Vite and PWA manifest/service-worker configuration.
 
+## Licence
+
+[MIT](LICENSE)
