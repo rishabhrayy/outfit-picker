@@ -107,13 +107,32 @@ Browser storage can be cleared by browser settings, private-browsing behaviour, 
 - **Keys are never included.** They live in `localStorage`, which the backup never reads, so a backup file is safe to keep in cloud storage.
 - **A bad file gets a plain reason**: not JSON, not a backup, made by a newer version, or damaged.
 
+### On an iPhone's home screen
+
+A normal download link is widely reported not to work in a web app launched from an iPhone's home screen, so there the backup goes through the share sheet instead, in two taps: **Prepare backup** builds the file, then **Save backup** opens the sheet — choose **Save to Files**. It takes two taps because Safari only lets the share sheet open straight from a tap, and building a backup is too slow to wait for first. Everywhere else (desktop, Android, a Safari tab) it is still one tap and a normal download.
+
+Which file types may be shared is up to the browser, so the app asks it about the actual file: JSON first, then the same bytes as plain text (saved as `….json.txt`) if JSON is refused. **Restore from a backup** accepts both. If the browser will share neither, the card says so and offers a direct download as a last resort.
+
+This was verified against a simulated iPhone home-screen app (user agent, `standalone`, a recording `share()`), including that the sheet is opened while the tap's user activation is still live — but not on a physical iPhone, so try **Prepare backup** then **Save backup** on yours before relying on it.
+
+A backup is built in memory as one file with the photos inside as base64, so a very large wardrobe makes a large file; the size is shown in the toast and on the Save button.
+
 ## Tests
 
 ```bash
 npm test
 ```
 
-17 tests (Vitest, with `fake-indexeddb` standing in for the browser): the backup round-trips photo bytes exactly, restores by id without duplicating or deleting, skips items whose photo is missing, never contains a key, and rejects bad files; the outfit logic ranks by weather without dropping a category, always keeps a requested item, and never pairs a dress with separates; and key detection picks the longest matching prefix. CI runs them and a production build on every push.
+125 tests (Vitest, with `fake-indexeddb` standing in for the browser and a stubbed `fetch` standing in for every AI provider):
+
+- **Backup**: round-trips photo bytes exactly, restores by id without duplicating or deleting, skips items whose photo is missing, never contains a key, and rejects bad files.
+- **AI requests**: what each of the four structured-output modes (strict schema, forced tool call, JSON object, plain text) actually sends and how it reads the reply; the auto-detect ladder stepping down in order, and *not* burning four calls on a rejected key or a rate limit; the retry on the stronger model; the Anthropic browser-access header; timeouts and cancelling; and the wording of every error message a person can hit.
+- **Provider settings**: the provider list, the active-provider fallback, corrupt or blocked storage, and the move from the old one-key-per-provider storage that must never lose a saved key.
+- **Bulk edit**: adding a tag merges into each item's own tags rather than replacing them, and a season change is split back into stored season and weather.
+- **Share sheet**: iPhone home-screen detection, the JSON-then-text fallback, and that `share()` starts before anything is awaited.
+- **Outfit logic and key detection**: weather ranking that never drops a category, a requested item always kept, no dress mixed with separates, and key mismatch warnings that fire for a real mismatch but not for providers that share a prefix.
+
+The suite was also checked the other way round: deliberately breaking the code in eight specific ways (for example, skipping the tool-call tier or letting `share()` wait) makes tests fail each time, so a green run means something. CI runs the tests and a production build on every push.
 
 ## Install it as an app
 

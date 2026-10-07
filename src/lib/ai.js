@@ -23,7 +23,7 @@
  * see ANTHROPIC_BROWSER_HOST below.
  */
 
-import { detectPresetFromKey, getPreset } from './providers.js';
+import { detectKeyMismatch, getPreset } from './providers.js';
 import { normalizeDetectedItem } from '../types.js';
 import { prepareImage } from './image.js';
 
@@ -38,6 +38,9 @@ const REQUEST_TIMEOUT_MS = 90_000;
 // host, not a per-provider flag, so a hand-typed Custom provider pointed at
 // the same host still works without the user needing to know this exists.
 const ANTHROPIC_BROWSER_HOST = 'api.anthropic.com';
+
+// Error bodies that are valid but carry nothing worth quoting back to a person.
+const BLANK_BODIES = new Set(['', '{}', '[]', 'null']);
 
 const CATEGORY_ENUM = ['top', 'bottom', 'dress', 'outerwear', 'shoes', 'accessory'];
 const SEASON_ENUM = ['spring', 'summer', 'autumn', 'winter', 'all-season'];
@@ -203,9 +206,9 @@ function statusMessage(status, detail, provider) {
     // Using one provider's key against another is the likeliest cause of a
     // rejected key, and a bare "key rejected" message sends people off
     // checking a perfectly good key instead of the provider selection.
-    const detectedId = detectPresetFromKey(provider.apiKey);
-    if (detectedId && detectedId !== provider.presetId) {
-      const detected = getPreset(detectedId);
+    const mismatchedId = detectKeyMismatch(provider.presetId, provider.apiKey);
+    if (mismatchedId) {
+      const detected = getPreset(mismatchedId);
       return `That looks like ${detected.article} ${detected.label} key, but this provider is set up as ${provider.label}. Check the key in Settings.`;
     }
     // Beyond a plain mismatch, the actual cause varies (revoked key, wrong
@@ -249,6 +252,8 @@ async function requestOnce({ provider, body, signal }) {
   }, REQUEST_TIMEOUT_MS);
   const forwardAbort = () => controller.abort();
   signal?.addEventListener('abort', forwardAbort);
+  // A listener never fires for a signal that was aborted before it was attached.
+  if (signal?.aborted) forwardAbort();
 
   let response;
   try {
@@ -286,7 +291,10 @@ async function requestOnce({ provider, body, signal }) {
   }
 
   if (!response.ok) {
-    const detail = extractErrorMessage(parsedBody) || rawText.slice(0, 300);
+    // The raw body is the fallback for a plain-text or HTML error page. An empty
+    // JSON object says nothing, and showing "{}" to someone is worse than the
+    // generic message that takes its place.
+    const detail = extractErrorMessage(parsedBody) || (BLANK_BODIES.has(rawText.trim()) ? '' : rawText.slice(0, 300));
     const error = new Error(detail || `HTTP ${response.status}`);
     error.status = response.status;
     error.rawDetail = detail;

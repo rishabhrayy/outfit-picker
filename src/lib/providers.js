@@ -212,27 +212,49 @@ export function getPreset(id) {
   return PROVIDER_PRESETS.find((preset) => preset.id === id) || PROVIDER_PRESETS.find((preset) => preset.id === 'custom');
 }
 
-/**
- * Guesses which preset a pasted key belongs to, purely to warn when a key's
- * shape clearly doesn't match the provider currently selected in the form.
- * Custom providers and prefix-less providers (Mistral, Together) return null
- * and are simply never second-guessed.
- */
-export function detectPresetFromKey(key) {
+function bestPrefixMatch(key) {
   const trimmed = String(key || '').trim();
   if (!trimmed) return null;
 
   // OpenRouter keys ("sk-or-…") also satisfy OpenAI's plain "sk-" prefix, so
   // the longest matching prefix wins rather than the first preset in the list.
   let best = null;
-  let bestLength = 0;
   for (const preset of PROVIDER_PRESETS) {
     for (const prefix of preset.keyPrefixes) {
-      if (trimmed.startsWith(prefix) && prefix.length > bestLength) {
-        best = preset.id;
-        bestLength = prefix.length;
+      if (trimmed.startsWith(prefix) && (!best || prefix.length > best.length)) {
+        best = { id: preset.id, length: prefix.length };
       }
     }
   }
   return best;
+}
+
+/** Which preset a pasted key's prefix points at, or null if it says nothing. */
+export function detectPresetFromKey(key) {
+  return bestPrefixMatch(key)?.id ?? null;
+}
+
+/**
+ * The preset a key looks like it belongs to — but only when that genuinely
+ * contradicts the provider it was pasted into, so a warning is never a false
+ * alarm about a perfectly good key.
+ *
+ *  - A Custom provider is never second-guessed: it means "I know what this is".
+ *  - Prefixes can be shared. DeepSeek and OpenAI keys both start "sk-", so a key
+ *    that fits this provider's own prefix as well as another's proves nothing.
+ *    Only a strictly more specific match ("sk-ant-" against "sk-") is a
+ *    contradiction.
+ */
+export function detectKeyMismatch(presetId, key) {
+  if (!presetId || presetId === 'custom') return null;
+
+  const best = bestPrefixMatch(key);
+  if (!best || best.id === presetId) return null;
+
+  const trimmed = String(key).trim();
+  const ownLength = Math.max(
+    0,
+    ...getPreset(presetId).keyPrefixes.filter((prefix) => trimmed.startsWith(prefix)).map((prefix) => prefix.length),
+  );
+  return best.length > ownLength ? best.id : null;
 }
