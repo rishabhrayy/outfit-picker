@@ -143,10 +143,10 @@ A backup is built in memory as one file with the photos inside as base64, so a v
 npm test
 ```
 
-139 tests (Vitest, with `fake-indexeddb` standing in for the browser and a stubbed `fetch` standing in for every AI provider):
+144 tests (Vitest, with `fake-indexeddb` standing in for the browser and a stubbed `fetch` standing in for every AI provider):
 
 - **Backup**: round-trips photo bytes exactly, restores by id without duplicating or deleting, skips items whose photo is missing, never contains a key, and rejects bad files.
-- **AI requests**: what each of the four structured-output modes (strict schema, forced tool call, JSON object, plain text) actually sends and how it reads the reply; the auto-detect ladder stepping down in order, and *not* burning four calls on a rejected key or a rate limit; the retry on the stronger model; the Anthropic browser-access header; timeouts and cancelling; and the wording of every error message a person can hit.
+- **AI requests**: what each of the four structured-output modes (strict schema, forced tool call, JSON object, plain text) actually sends and how it reads the reply; the auto-detect ladder stepping down in order, and *not* burning four calls on a rejected key or a rate limit; the retry on the stronger model (for outfits too, but never after a rejected key, a timeout or a lost connection); the Anthropic browser-access header; timeouts and cancelling; and the wording of every error message a person can hit.
 - **Built-in AI route**: a wrong or missing passcode never reaches Gemini, the server key goes to Google and the passcode doesn't, only the allowed models get through, `max_tokens` is capped, and Google rejecting the server's key (which it reports as a 400) reads as a host setup problem rather than a wrong passcode.
 - **Provider settings**: the provider list, the active-provider fallback, corrupt or blocked storage, and the move from the old one-key-per-provider storage that must never lose a saved key.
 - **Bulk edit**: adding a tag merges into each item's own tags rather than replacing them, and a season change is split back into stored season and weather.

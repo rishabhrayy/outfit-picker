@@ -193,7 +193,11 @@ function toDisplayError(error, provider) {
     return new Error(error.message);
   }
   if (typeof error?.status === 'number') {
-    return new Error(statusMessage(error.status, error.rawDetail ?? error.message, provider));
+    const display = new Error(statusMessage(error.status, error.rawDetail ?? error.message, provider));
+    // Kept so callers can tell a rejected key (no point retrying) from an
+    // overloaded model (worth one try on the other model).
+    display.status = error.status;
+    return display;
   }
   if (error instanceof SyntaxError) {
     return new Error(`${provider.label} returned a reply this app could not read. Try again.`);
@@ -620,9 +624,9 @@ export async function suggestOutfit({
     .filter(Boolean)
     .join('\n');
 
-  const { data, jsonMode } = await callChatJson({
+  const attempt = (model) => callChatJson({
     provider,
-    model: provider.model,
+    model,
     maxTokens: provider.outfitMaxTokens,
     schema: OUTFIT_SCHEMA,
     signal,
@@ -631,6 +635,23 @@ export async function suggestOutfit({
       { role: 'user', content: request },
     ],
   });
+
+  let result;
+  try {
+    result = await attempt(provider.model);
+  } catch (error) {
+    // One retry on the fallback model, as tagging does. Gemini answers 503
+    // "high demand" often enough (seen twice in three live calls) that a
+    // single overloaded model shouldn't end the request. Only an error the
+    // provider actually answered with is retried: a rejected key or passcode
+    // would fail the same way on any model, and retrying a timeout or a lost
+    // connection would just make someone wait twice as long to see it fail.
+    const fallbackModel = provider.fallbackModel;
+    const retryable = typeof error?.status === 'number' && error.status !== 401 && error.status !== 403;
+    if (!retryable || !fallbackModel || fallbackModel === provider.model) throw error;
+    result = await attempt(fallbackModel);
+  }
+  const { data, jsonMode } = result;
 
   const known = new Set(candidates.map((item) => item.id));
   const itemIds = [...new Set(Array.isArray(data?.itemIds) ? data.itemIds : [])]

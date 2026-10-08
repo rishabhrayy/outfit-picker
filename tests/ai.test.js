@@ -165,7 +165,9 @@ describe('how each JSON mode asks for structure', () => {
 // ------------------------------------------------------------ auto-detect ladder
 
 describe('auto-detect', () => {
-  const auto = () => makeProvider({ jsonMode: 'auto' });
+  // One model, so these test the format ladder alone; the retry on a second
+  // model is tested under suggestOutfit.
+  const auto = () => makeProvider({ jsonMode: 'auto', fallbackModel: '' });
 
   it('moves past a provider that ignores response_format and answers in prose, and reports where it landed', async () => {
     // This is what Anthropic's OpenAI-compatible endpoint does: 200 OK, format ignored.
@@ -223,7 +225,7 @@ describe('auto-detect', () => {
 
   it('never steps down once a tier is pinned, even on a response_format error', async () => {
     const calls = stubFetch(failWith(400, 'response_format is not supported'), asToolCall(PICK));
-    await expect(outfitCall(makeProvider({ jsonMode: 'schema' }))).rejects.toThrow('OpenAI error 400');
+    await expect(outfitCall(makeProvider({ jsonMode: 'schema', fallbackModel: '' }))).rejects.toThrow('OpenAI error 400');
     expect(calls).toHaveLength(1);
   });
 
@@ -481,6 +483,34 @@ describe('suggestOutfit', () => {
   it('fails clearly when the model names nothing real', async () => {
     stubFetch(asJson({ itemIds: ['ghost', 'phantom'], explanation: 'Trust me.' }));
     await expect(outfitCall(makeProvider())).rejects.toThrow('No wearable combination came back');
+  });
+
+  it('retries once on the fallback model when the first is overloaded', async () => {
+    const calls = stubFetch(failWith(503, 'This model is currently experiencing high demand.'), asJson(PICK));
+    const result = await outfitCall(makeProvider());
+    expect(calls.map((call) => call.body.model)).toEqual(['gpt-4o-mini', 'gpt-4o']);
+    expect(result.itemIds).toEqual(['a', 'c']);
+  });
+
+  it('reports the second model\'s failure if both fail, without a third try', async () => {
+    const calls = stubFetch(failWith(429, 'slow down'));
+    await expect(outfitCall(makeProvider())).rejects.toThrow('rate-limiting');
+    expect(calls).toHaveLength(2);
+  });
+
+  it.each([
+    ['a rejected key', () => failWith(401, 'bad key')],
+    ['a lost connection', () => { throw new TypeError('Failed to fetch'); }],
+  ])('does not retry on the other model after %s, which no model could fix', async (_label, responder) => {
+    const calls = stubFetch(responder);
+    await expect(outfitCall(makeProvider())).rejects.toThrow();
+    expect(calls).toHaveLength(1);
+  });
+
+  it('does not retry when there is no distinct fallback model', async () => {
+    const calls = stubFetch(failWith(503, 'busy'));
+    await expect(outfitCall(makeProvider({ fallbackModel: 'gpt-4o-mini' }))).rejects.toThrow();
+    expect(calls).toHaveLength(1);
   });
 
   it('does not call out at all with nothing to choose from', async () => {
