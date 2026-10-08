@@ -8,6 +8,8 @@ export default async function handler(req, res) {
     authorization: req.headers.authorization,
     body: req.body,
     env: process.env,
+    // Vercel puts the caller's address first in x-forwarded-for.
+    client: String(req.headers['x-real-ip'] || req.headers['x-forwarded-for'] || 'unknown').split(',')[0].trim(),
   });
   res.setHeader('Cache-Control', 'no-store');
   res.status(status).json(body);

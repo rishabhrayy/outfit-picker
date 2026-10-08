@@ -83,6 +83,7 @@ export async function prepareImage(file) {
       if (!API_SAFE_TYPES.has(file.type)) {
         throw new Error(
           `This browser cannot open ${file.type || 'that file type'}. Save the photo as a JPEG or PNG and try again.`,
+          { cause: error },
         );
       }
       return { blob: file, dataUrl: await blobToDataUrl(file), width: 0, height: 0 };

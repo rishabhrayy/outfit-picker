@@ -208,6 +208,7 @@ function toDisplayError(error, provider) {
     // overloaded model (worth one try on the other model).
     display.status = error.status;
     display.dailyQuota = error.status === 429 && isDailyQuota(error.rawDetail ?? error.message);
+    if (display.dailyQuota) display.retryAfterMs = retryAfterMs(error.rawDetail ?? error.message);
     return display;
   }
   if (error instanceof SyntaxError) {
@@ -223,6 +224,108 @@ function toDisplayError(error, provider) {
  */
 function isDailyQuota(detail) {
   return /free_tier|per ?day|perday|quota exceeded for metric/i.test(String(detail || ''));
+}
+
+/** "Please retry in 12h26.5s" -> milliseconds, or 0 if it doesn't say. */
+function retryAfterMs(detail) {
+  const match = String(detail || '').match(/retry in (?:(\d+)h)?(?:(\d+)m)?(?:([\d.]+)s)?/i);
+  if (!match || !(match[1] || match[2] || match[3])) return 0;
+  return ((Number(match[1] || 0) * 60 + Number(match[2] || 0)) * 60 + Number(match[3] || 0)) * 1000;
+}
+
+/** Free-tier daily allowances reset at midnight Pacific time. */
+export function nextPacificMidnight(now = new Date()) {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Los_Angeles', hour12: false, hour: 'numeric', minute: 'numeric', second: 'numeric',
+  }).formatToParts(now).map((part) => [part.type, Number(part.value)]));
+  const elapsed = (((parts.hour % 24) * 60 + parts.minute) * 60 + parts.second) * 1000;
+  return now.getTime() + (24 * 3600 * 1000 - elapsed);
+}
+
+// Models known to be out of today's allowance, by provider and model, with
+// when they reset. Kept in localStorage so a reload doesn't start wasting
+// calls again; unavailable storage just means no memory, never an error.
+const EXHAUSTED_STORAGE_KEY = 'outfit-picker-ai-exhausted';
+
+function exhaustionKey(provider, model) {
+  return `${provider?.baseUrl || ''}|${model}`;
+}
+
+function readExhausted() {
+  try {
+    const parsed = JSON.parse(globalThis.localStorage?.getItem(EXHAUSTED_STORAGE_KEY) || '{}');
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeExhausted(map) {
+  try {
+    globalThis.localStorage?.setItem(EXHAUSTED_STORAGE_KEY, JSON.stringify(map));
+  } catch {
+    // No storage: the app just won't remember, and will find out again by asking.
+  }
+}
+
+export function markExhausted(provider, model, resetInMs = 0, now = Date.now()) {
+  const map = readExhausted();
+  map[exhaustionKey(provider, model)] = resetInMs > 0 ? now + resetInMs : nextPacificMidnight(new Date(now));
+  writeExhausted(map);
+}
+
+export function isExhausted(provider, model, now = Date.now()) {
+  const until = Number(readExhausted()[exhaustionKey(provider, model)]);
+  return Number.isFinite(until) && until > now;
+}
+
+/** When the soonest of a provider's exhausted models resets, or 0. */
+export function exhaustedUntil(provider, now = Date.now()) {
+  const times = [provider?.model, provider?.fallbackModel].filter(Boolean)
+    .map((model) => Number(readExhausted()[exhaustionKey(provider, model)]))
+    .filter((until) => Number.isFinite(until) && until > now);
+  return times.length ? Math.min(...times) : 0;
+}
+
+function exhaustedError(provider) {
+  const until = exhaustedUntil(provider);
+  const hours = until ? Math.max(1, Math.round((until - Date.now()) / 3600_000)) : 0;
+  const error = new Error(`${provider.label} has used up today's free allowance${hours ? `; it resets in about ${hours} hour${hours === 1 ? '' : 's'}` : ''}. Adding billing to the key's Google project lifts the limit.`);
+  error.status = 429;
+  error.dailyQuota = true;
+  return error;
+}
+
+// Requests sent today, per provider, so Settings can show how much of a free
+// tier's daily allowance has gone. "Today" is the Pacific-time day, because
+// that's when Google's free allowances reset.
+const USAGE_STORAGE_KEY = 'outfit-picker-ai-usage';
+
+export function pacificDay(now = new Date()) {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Los_Angeles' }).format(now);
+}
+
+function recordUsage(provider, now = new Date()) {
+  try {
+    const day = pacificDay(now);
+    const stored = JSON.parse(globalThis.localStorage?.getItem(USAGE_STORAGE_KEY) || '{}');
+    const counts = stored?.day === day ? stored.counts || {} : {};
+    const key = provider?.id || 'unknown';
+    counts[key] = (counts[key] || 0) + 1;
+    globalThis.localStorage?.setItem(USAGE_STORAGE_KEY, JSON.stringify({ day, counts }));
+  } catch {
+    // Counting is a nicety; never let it break a request.
+  }
+}
+
+/** How many requests went to this provider today (Pacific time). */
+export function usageToday(provider, now = new Date()) {
+  try {
+    const stored = JSON.parse(globalThis.localStorage?.getItem(USAGE_STORAGE_KEY) || '{}');
+    return stored?.day === pacificDay(now) ? Number(stored.counts?.[provider?.id]) || 0 : 0;
+  } catch {
+    return 0;
+  }
 }
 
 /** "Please retry in 12h26.5s" -> "about 12 hours", for a human. */
@@ -322,15 +425,16 @@ async function requestOnce({ provider, body, signal }) {
     });
   } catch (error) {
     if (timedOut) {
-      throw new Error(`${provider.label} did not respond within ${Math.round(REQUEST_TIMEOUT_MS / 1000)} seconds. Try again.`);
+      throw new Error(`${provider.label} did not respond within ${Math.round(REQUEST_TIMEOUT_MS / 1000)} seconds. Try again.`, { cause: error });
     }
     if (error?.name === 'AbortError') throw error;
-    throw new Error(`Could not reach ${provider.label}. Check your internet connection, and that its base URL is correct.`);
+    throw new Error(`Could not reach ${provider.label}. Check your internet connection, and that its base URL is correct.`, { cause: error });
   } finally {
     clearTimeout(timer);
     signal?.removeEventListener('abort', forwardAbort);
   }
 
+  recordUsage(provider);
   const rawText = await response.text();
   let parsedBody = null;
   try {
@@ -597,23 +701,31 @@ export async function tagPhoto(file, { provider, signal } = {}) {
     return { items: found.map(toReviewItem).filter(Boolean), jsonMode };
   };
 
-  const fallbackModel = provider.fallbackModel || provider.model;
-  let primary;
+  // Same rules as every other call: a busy or broken model gets one try on the
+  // backup, a rejected key or used-up allowance doesn't.
+  let usedModel = provider.model;
+  const primary = await withFallbackModel(provider, (model) => {
+    usedModel = model;
+    return attempt(model);
+  });
+  const answered = { items: primary.items, model: usedModel, usedFallback: usedModel !== provider.model, jsonMode: primary.jsonMode };
+
+  // An empty answer is also what a struggling model gives, so a different
+  // model gets one look. Not the same model twice, and not one that's out of
+  // today's allowance: on a free tier those calls are wasted.
+  const fallbackModel = provider.fallbackModel;
+  const worthAnotherLook = !primary.items.length && fallbackModel && fallbackModel !== usedModel && !isExhausted(provider, fallbackModel);
+  if (!worthAnotherLook) return answered;
+
   try {
-    primary = await attempt(provider.model);
+    const second = await attempt(fallbackModel);
+    return { items: second.items, model: fallbackModel, usedFallback: true, jsonMode: second.jsonMode };
   } catch (error) {
     if (error?.name === 'AbortError') throw error;
-    // A failed first call is still worth one retry on the fallback model.
-    const fallback = await attempt(fallbackModel);
-    return { items: fallback.items, model: fallbackModel, usedFallback: true, jsonMode: fallback.jsonMode };
+    if (error?.dailyQuota) markExhausted(provider, fallbackModel, error.retryAfterMs);
+    // The first answer stands: "nothing found" beats an error.
+    return answered;
   }
-
-  if (primary.items.length) {
-    return { items: primary.items, model: provider.model, usedFallback: false, jsonMode: primary.jsonMode };
-  }
-
-  const fallback = await attempt(fallbackModel);
-  return { items: fallback.items, model: fallbackModel, usedFallback: true, jsonMode: fallback.jsonMode };
 }
 
 /**
@@ -625,14 +737,27 @@ export async function tagPhoto(file, { provider, signal } = {}) {
  * connection would just make someone wait twice as long to see it fail.
  */
 async function withFallbackModel(provider, attempt) {
+  const fallbackModel = provider.fallbackModel && provider.fallbackModel !== provider.model ? provider.fallbackModel : '';
+  const tracked = (model) => attempt(model).catch((error) => {
+    if (error?.dailyQuota) markExhausted(provider, model, error.retryAfterMs);
+    throw error;
+  });
+
+  // A model already known to be out of today's allowance isn't asked again
+  // until it resets: on a 20-a-day free tier, every wasted call counts.
+  if (isExhausted(provider, provider.model)) {
+    if (!fallbackModel || isExhausted(provider, fallbackModel)) throw exhaustedError(provider);
+    return tracked(fallbackModel);
+  }
+
   try {
-    return await attempt(provider.model);
+    return await tracked(provider.model);
   } catch (error) {
-    const fallbackModel = provider.fallbackModel;
     const retryable = typeof error?.status === 'number' && error.status !== 401 && error.status !== 403;
-    if (!retryable || !fallbackModel || fallbackModel === provider.model) throw error;
+    if (!retryable || !fallbackModel) throw error;
+    if (isExhausted(provider, fallbackModel)) throw error;
     try {
-      return await attempt(fallbackModel);
+      return await tracked(fallbackModel);
     } catch (fallbackError) {
       // Main model out of today's allowance, backup busy: say both, since
       // "busy" alone sends people to retry a model that can't answer today.

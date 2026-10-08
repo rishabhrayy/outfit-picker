@@ -219,6 +219,38 @@ export function setRepeatDays(value) {
   return writeStorage(REPEAT_DAYS_STORAGE_KEY, String(safe));
 }
 
+const LAST_BACKUP_STORAGE_KEY = 'outfit-picker-last-backup';
+const BACKUP_NUDGE_SNOOZE_STORAGE_KEY = 'outfit-picker-backup-nudge-snoozed-until';
+
+/** When a backup was last saved from this device (ms), or 0 if never. */
+export function getLastBackupAt() {
+  const value = Number(readStorage(LAST_BACKUP_STORAGE_KEY));
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+export function setLastBackupAt(when = Date.now()) {
+  return writeStorage(LAST_BACKUP_STORAGE_KEY, String(when));
+}
+
+export const BACKUP_NUDGE_AFTER_DAYS = 30;
+export const BACKUP_NUDGE_MIN_ITEMS = 5;
+
+/**
+ * Whether to suggest a backup: enough of a wardrobe to lose, no backup in
+ * the last month (or ever), and not dismissed in the last week.
+ */
+export function shouldNudgeBackup(itemCount, now = Date.now()) {
+  if (itemCount < BACKUP_NUDGE_MIN_ITEMS) return false;
+  const snoozedUntil = Number(readStorage(BACKUP_NUDGE_SNOOZE_STORAGE_KEY)) || 0;
+  if (snoozedUntil > now) return false;
+  const last = getLastBackupAt();
+  return !last || now - last > BACKUP_NUDGE_AFTER_DAYS * 86_400_000;
+}
+
+export function snoozeBackupNudge(days = 7, now = Date.now()) {
+  return writeStorage(BACKUP_NUDGE_SNOOZE_STORAGE_KEY, String(now + days * 86_400_000));
+}
+
 const OUTFIT_PREFERENCES_STORAGE_KEY = 'outfit-picker-outfit-preferences';
 const KNOWN_OCCASIONS = ['Everyday', 'Work', 'Dinner', 'Date night', 'Event', 'Active'];
 const KNOWN_VIBES = ['Easy', 'Polished', 'Playful', 'Minimal', 'Sporty', 'Bold'];

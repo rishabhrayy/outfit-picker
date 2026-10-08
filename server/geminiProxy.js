@@ -45,9 +45,43 @@ function allowedModels(env) {
 }
 
 /**
+ * A sliding-window counter per client. In memory, so it's best-effort: each
+ * running copy of the function keeps its own count, and a cold start resets
+ * it. It still slows someone hammering the route, or guessing the passcode,
+ * from one address; a hard cap across copies would need a shared store.
+ */
+export function createRateLimiter({ limit, windowMs, now = () => Date.now() }) {
+  const hits = new Map();
+  return {
+    // True if this client is still within the limit (and counts the attempt).
+    allow(client) {
+      const time = now();
+      const recent = (hits.get(client) || []).filter((stamp) => time - stamp < windowMs);
+      if (recent.length >= limit) {
+        hits.set(client, recent);
+        return false;
+      }
+      recent.push(time);
+      hits.set(client, recent);
+      // Keep the map from growing forever on a long-lived instance.
+      if (hits.size > 5000) hits.delete(hits.keys().next().value);
+      return true;
+    },
+  };
+}
+
+// Far above one person's real use: tagging a 20-photo batch is ~20-40 calls.
+const requestLimiter = createRateLimiter({ limit: 30, windowMs: 10 * 60_000 });
+// Guessing the passcode: ten wrong tries per ten minutes per address.
+const wrongPasscodeLimiter = createRateLimiter({ limit: 10, windowMs: 10 * 60_000 });
+
+/**
  * @returns {Promise<{status: number, body: object}>}
  */
-export async function handleGeminiProxy({ method, authorization, body, env = {}, fetchImpl = globalThis.fetch }) {
+export async function handleGeminiProxy({
+  method, authorization, body, env = {}, fetchImpl = globalThis.fetch,
+  client = 'unknown', limiter = requestLimiter, guessLimiter = wrongPasscodeLimiter,
+}) {
   if (method !== 'POST') return error(405, 'Use POST.');
 
   const apiKey = String(env.GEMINI_API_KEY || '').trim();
@@ -58,7 +92,12 @@ export async function handleGeminiProxy({ method, authorization, body, env = {},
 
   const given = String(authorization || '').replace(/^Bearer\s+/i, '').trim();
   if (!given || !sameSecret(given, passcode)) {
+    if (!guessLimiter.allow(client)) return error(429, 'Too many wrong passcodes from this device. Wait ten minutes.');
     return error(401, 'Wrong passcode for the built-in AI.');
+  }
+
+  if (!limiter.allow(client)) {
+    return error(429, 'Too many requests from this device in the last ten minutes. Wait a few minutes and try again.');
   }
 
   if (!body || typeof body !== 'object' || Array.isArray(body)) {

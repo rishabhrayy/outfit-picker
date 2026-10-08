@@ -183,6 +183,70 @@ export function shuffleOutfit(items, filters = {}, repeatDays = 7, random = Math
   };
 }
 
+// Colour words people actually use, grouped. Neutrals are checked first (see
+// NEUTRAL_COLORS), so "navy" and "denim" go with anything while "light blue"
+// is a blue.
+const HUE_FAMILIES = [
+  ["red", ["red", "burgundy", "maroon", "wine", "crimson", "scarlet", "cherry"]],
+  ["orange", ["orange", "rust", "terracotta", "coral", "peach", "apricot"]],
+  ["yellow", ["yellow", "mustard", "gold", "lemon"]],
+  ["green", ["green", "sage", "mint", "emerald", "forest", "lime", "teal"]],
+  ["blue", ["blue", "cobalt", "sky", "turquoise", "aqua", "cyan"]],
+  ["purple", ["purple", "lilac", "lavender", "violet", "plum", "mauve"]],
+  ["pink", ["pink", "blush", "rose", "fuchsia", "magenta", "salmon"]],
+];
+
+// Pairings that fight, two strong colours side by side. Kept short on purpose:
+// most colour pairs are fine, and the stylist (or the person) can be bolder.
+const CLASHING_HUES = new Set(
+  [["red", "orange"], ["red", "pink"], ["orange", "pink"], ["orange", "purple"], ["red", "green"], ["pink", "yellow"]]
+    .map((pair) => pair.sort().join("|")),
+);
+
+export function colourFamily(color) {
+  const word = String(color || "").trim().toLowerCase();
+  if (!word) return null;
+  if (NEUTRAL_COLORS.some((neutral) => word.includes(neutral))) return "neutral";
+  const match = HUE_FAMILIES.find(([, words]) => words.some((hue) => word.includes(hue)));
+  return match ? match[0] : null;
+}
+
+function strongColours(item) {
+  return new Set((item?.colors || []).map(colourFamily).filter((family) => family && family !== "neutral"));
+}
+
+/**
+ * How well two pieces go together by colour: 1 if one is neutral or they
+ * share a colour family (tonal), -3 for a classic clash, 0 otherwise. Pieces
+ * with no colours tagged count as neutral, since there's nothing to clash.
+ */
+export function colourHarmony(a, b) {
+  const first = strongColours(a);
+  const second = strongColours(b);
+  if (!first.size || !second.size) return 1;
+  if ([...first].some((family) => second.has(family))) return 1;
+  for (const x of first) {
+    for (const y of second) {
+      if (CLASHING_HUES.has([x, y].sort().join("|"))) return -3;
+    }
+  }
+  return 0;
+}
+
+/** A whole outfit's colour score: every pair, minus a little for three or more loud pieces. */
+export function outfitHarmony(items) {
+  let score = 0;
+  for (let i = 0; i < items.length; i += 1) {
+    for (let j = i + 1; j < items.length; j += 1) score += colourHarmony(items[i], items[j]);
+  }
+  const loud = items.filter((item) => strongColours(item).size > 0).length;
+  return loud > 2 ? score - 2 : score;
+}
+
+// How much colour counts against the other signals: a clash (-3 x 6 = -18)
+// outweighs the weather match (+16), so it's avoided whenever there's choice.
+const HARMONY_WEIGHT = 6;
+
 /**
  * The best-ranked outfit, with no randomness — what's shown when there's no
  * AI provider, or the AI call failed. Same rules as the shuffle: available
@@ -229,6 +293,27 @@ function assembleOutfit(ranked, filters = {}, random = Math.random) {
     return list[Math.floor(random() * poolSize)];
   };
 
+  // Re-ranks candidates by how well their colours go with what's already
+  // chosen, on top of their weather/style/recency score. A requested piece
+  // always stays first.
+  // A clashing piece is dropped entirely while anything else is available:
+  // re-ranking alone isn't enough, because the shuffle chooses at random among
+  // the top few.
+  const byHarmonyWith = (list, chosen) => {
+    const scored = list.map((item) => {
+      const harmonies = chosen.map((other) => colourHarmony(item, other));
+      return {
+        item,
+        clashes: harmonies.some((value) => value < 0),
+        score: (item._outfitScore || 0) + HARMONY_WEIGHT * harmonies.reduce((sum, value) => sum + value, 0) / Math.max(1, chosen.length),
+      };
+    });
+    const calm = scored.filter((entry) => !entry.clashes);
+    return (calm.length ? calm : scored)
+      .sort((a, b) => b.score - a.score)
+      .map(({ item }) => item);
+  };
+
   // The defining pair (top + bottom, or dress + shoes) is chosen together, so
   // a ruled-out combination is skipped rather than retried until it misses.
   const choosePair = (firstCategory, secondCategory) => {
@@ -239,7 +324,7 @@ function assembleOutfit(ranked, filters = {}, random = Math.random) {
     // Every combination ruled out: an outfit that repeats one beats no outfit.
     if (!viable.length) return [choose(firsts), choose(seconds)];
     const first = choose(viable);
-    return [first, choose(seconds.filter((second) => !isBlocked(first, second)))];
+    return [first, choose(byHarmonyWith(seconds.filter((second) => !isBlocked(first, second)), [first]))];
   };
 
   const hasDresses = bucket("dress").length > 0;
@@ -249,17 +334,24 @@ function assembleOutfit(ranked, filters = {}, random = Math.random) {
     : hasDresses && (!hasTopAndBottom || (random ? random() < 0.5 : false));
 
   const chilly = COLD_WEATHER.has(filters.weather) || Boolean(filters.rain);
+  let core;
+  if (useDress) {
+    core = choosePair("dress", "shoes");
+  } else {
+    const [top, bottom] = choosePair("top", "bottom");
+    const pair = [top, bottom].filter(Boolean);
+    core = [top, bottom, choose(byHarmonyWith(bucket("shoes"), pair))];
+  }
+  const worn = core.filter(Boolean);
+
+  // Layers and extras are optional, and chosen to suit what's already on.
   const optional = (category, chance) => {
     if (wanted?.category === category) return wanted;
-    if (random) return random() < chance ? choose(bucket(category)) : null;
-    return chance >= 0.5 ? choose(bucket(category)) : null;
+    const include = random ? random() < chance : chance >= 0.5;
+    return include ? choose(byHarmonyWith(bucket(category), worn)) : null;
   };
   const outerwear = optional("outerwear", chilly ? 0.9 : 0.3);
   const accessory = optional("accessory", 0.3);
-
-  const core = useDress
-    ? choosePair("dress", "shoes")
-    : [...choosePair("top", "bottom"), choose(bucket("shoes"))];
 
   return [...core, outerwear, accessory].filter(Boolean);
 }

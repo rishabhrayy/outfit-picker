@@ -551,3 +551,46 @@ button { -webkit-tap-highlight-color: transparent; }
 .feedback-details { margin: 14px 0 4px; border-top: 1px solid var(--line); padding-top: 10px; }
 .feedback-details summary { min-height: 44px; display: flex; align-items: center; font-size: 13px; font-weight: 750; cursor: pointer; }
 .feedback-details[open] summary { margin-bottom: 8px; }
+.usage-line { display: block; font-size: 11px; color: var(--muted); margin-top: 2px; }
+.usage-line.is-out { color: #9a3d12; font-weight: 700; }
+.backup-age { margin-top: 6px !important; font-weight: 700; color: #3f6a2e !important; }
+.backup-age.is-stale { color: #9a3d12 !important; }
+.backup-nudge { margin: 0 0 14px; padding: 12px; border-radius: 14px; background: #fdf0e2; border: 1px solid #f0d5b4; }
+.backup-nudge p { margin: 0 0 10px; font-size: 13px; line-height: 1.45; color: #6b3712; }
+.backup-nudge div { display: flex; align-items: center; gap: 14px; }
+
+/* Wardrobe search and sort. */
+.wardrobe-tools { display: flex; gap: 8px; margin: 0 0 10px; }
+.wardrobe-tools input { flex: 1; min-width: 0; min-height: 44px; font-size: 16px; color: var(--ink); padding: 9px 12px; border: 1px solid var(--line); border-radius: 12px; background: white; }
+.wardrobe-tools select { flex-shrink: 0; min-height: 44px; max-width: 46%; font-size: 14px; color: var(--ink); padding: 8px 10px; border: 1px solid var(--line); border-radius: 12px; background: white; }
+
+/* Journal week strip. */
+.week-strip { margin: 14px 0 6px; padding: 8px; border: 1px solid var(--line); border-radius: 16px; background: white; }
+.week-strip-header { display: flex; align-items: center; justify-content: space-between; }
+.week-strip-header strong { font-size: 13px; }
+.week-strip-days { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px; }
+.week-day { display: grid; justify-items: center; gap: 3px; padding: 6px 2px; border: 1px solid transparent; border-radius: 12px; background: none; color: var(--ink); cursor: pointer; min-height: 44px; }
+.week-day > span:first-child { font-size: 11px; color: var(--muted); }
+.week-day > strong { font-size: 13px; }
+.week-day.is-today > strong { background: var(--ink); color: white; border-radius: 999px; min-width: 24px; padding: 1px 6px; }
+.week-day.is-selected { border-color: var(--ink); background: var(--canvas); }
+.week-day-photo { width: 32px; height: 40px; border-radius: 7px; border: 2px solid #8fbf5a; }
+.week-day.has-planned .week-day-photo { border: 2px dashed #9b84c9; }
+.week-day-empty { width: 32px; height: 40px; border-radius: 7px; border: 1px dashed var(--line); }
+.week-day-photo.photo-placeholder svg { width: 60%; }
+.day-filter-note { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 13px; color: var(--muted); margin: 4px 0 0; }
+
+/* First run. */
+.first-run-steps { list-style: none; margin: 0 0 18px; padding: 0; display: grid; gap: 8px; }
+.first-run-steps li { display: flex; align-items: center; gap: 12px; padding: 12px; border: 1px solid var(--line); border-radius: 14px; background: white; }
+.first-run-steps li.is-done { background: #f6fbef; border-color: #d6e9bf; }
+.first-run-steps li > div { flex: 1; min-width: 0; display: grid; gap: 2px; }
+.first-run-steps strong { font-size: 14px; }
+.first-run-steps em { font-style: normal; font-weight: 500; color: var(--muted); }
+.first-run-steps small { font-size: 12px; color: var(--muted); line-height: 1.4; }
+.step-mark { flex: 0 0 28px; height: 28px; border-radius: 50%; display: grid; place-items: center; font-weight: 800; font-size: 13px; background: var(--canvas); color: var(--ink); }
+.is-done .step-mark { background: #8fbf5a; color: white; }
+.quick-basics { padding: 14px; border-radius: 16px; background: var(--canvas); border: 1px solid var(--line); }
+.quick-basics h3 { margin: 0 0 4px; font-size: 15px; }
+.quick-basics p { margin: 0 0 12px; font-size: 12px; color: var(--muted); line-height: 1.45; }
+.quick-basics .chip-row { margin-bottom: 14px; }

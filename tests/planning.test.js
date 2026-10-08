@@ -180,3 +180,47 @@ describe('pack for a trip', () => {
     expect(packForTrip(closet, [])).toEqual({ packingList: [], outfits: [] });
   });
 });
+
+describe('colour harmony in the instant pick', () => {
+  it('sorts colour words into families, with neutrals going with anything', async () => {
+    const { colourFamily, colourHarmony, outfitHarmony } = await import('../src/lib/outfit.js');
+    expect(['navy', 'light blue', 'Burgundy', 'denim', 'sage', 'hot pink', 'plaid'].map(colourFamily)).toEqual(['neutral', 'blue', 'red', 'neutral', 'green', 'pink', null]);
+    const red = item('r', 'top', { colors: ['red'] });
+    const orange = item('o', 'bottom', { colors: ['orange'] });
+    const navy = item('n', 'bottom', { colors: ['navy'] });
+    const maroon = item('m', 'bottom', { colors: ['maroon'] });
+    const green = item('g', 'bottom', { colors: ['green'] });
+    expect(colourHarmony(red, orange)).toBe(-3);
+    expect(colourHarmony(red, navy)).toBe(1);
+    expect(colourHarmony(red, maroon)).toBe(1);
+    expect(colourHarmony(red, green)).toBe(-3);
+    expect(colourHarmony(red, item('b', 'bottom', { colors: ['blue'] }))).toBe(0);
+    expect(colourHarmony(red, item('x', 'bottom'))).toBe(1);
+    expect(outfitHarmony([red, orange, item('p', 'shoes', { colors: ['pink'] })])).toBeLessThan(outfitHarmony([red, navy, item('w', 'shoes', { colors: ['white'] })]));
+  });
+
+  it('never pairs a clash when a neutral is there, even if the clashing piece ranks higher', () => {
+    const closetWithColour = [
+      item('red-top', 'top', { colors: ['red'], seasons: ['summer'] }),
+      item('orange-shorts', 'bottom', { colors: ['orange'], seasons: ['summer'] }),
+      item('navy-jeans', 'bottom', { colors: ['navy'] }),
+      item('white-shoes', 'shoes', { colors: ['white'] }),
+    ];
+    // Orange shorts match the hot weather and navy jeans don't, so on weather
+    // alone the shorts would win.
+    expect(localOutfit(closetWithColour, { weather: 'hot', requiredItemId: 'red-top' }).itemIds).toContain('navy-jeans');
+    many(40, (seed) => {
+      expect(shuffleOutfit(closetWithColour, { weather: 'hot', requiredItemId: 'red-top' }, 7, seeded(seed + 1)).itemIds).not.toContain('orange-shorts');
+    });
+  });
+
+  it('picks shoes that go with the top and bottom', () => {
+    const shoesCloset = [
+      item('pink-top', 'top', { colors: ['pink'] }),
+      item('jeans', 'bottom', { colors: ['denim'] }),
+      item('red-shoes', 'shoes', { colors: ['red'] }),
+      item('black-shoes', 'shoes', { colors: ['black'] }),
+    ];
+    expect(localOutfit(shoesCloset).itemIds).toContain('black-shoes');
+  });
+});

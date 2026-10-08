@@ -9,8 +9,12 @@ function geminiReplies(status, body) {
   return vi.fn(async () => new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } }));
 }
 
+// Unlimited unless a test is about the limits, so no test depends on how many
+// requests the others happened to make.
+const unlimited = { allow: () => true };
+
 function call(overrides = {}) {
-  return handleGeminiProxy({ method: 'POST', authorization: 'Bearer open sesame', body: chat, env, fetchImpl: geminiReplies(200, { choices: [] }), ...overrides });
+  return handleGeminiProxy({ method: 'POST', authorization: 'Bearer open sesame', body: chat, env, fetchImpl: geminiReplies(200, { choices: [] }), limiter: unlimited, guessLimiter: unlimited, ...overrides });
 }
 
 describe('built-in AI route', () => {
@@ -92,5 +96,35 @@ describe('built-in AI route', () => {
   it('reports an unreachable Gemini as a 502', async () => {
     const result = await call({ fetchImpl: vi.fn(async () => { throw new TypeError('fetch failed'); }) });
     expect(result.status).toBe(502);
+  });
+});
+
+describe('built-in AI route limits', () => {
+  it('slows a device sending more than its share, without affecting another', async () => {
+    const { createRateLimiter } = await import('../server/geminiProxy.js');
+    let time = 0;
+    const limiter = createRateLimiter({ limit: 3, windowMs: 1000, now: () => time });
+    const send = (client) => call({ client, limiter, fetchImpl: geminiReplies(200, { choices: [] }) });
+    expect((await send('a')).status).toBe(200);
+    expect((await send('a')).status).toBe(200);
+    expect((await send('a')).status).toBe(200);
+    const blocked = await send('a');
+    expect(blocked.status).toBe(429);
+    expect(blocked.body.error.message).toMatch(/Too many requests/);
+    expect((await send('b')).status).toBe(200);
+    time = 1500;
+    expect((await send('a')).status).toBe(200);
+  });
+
+  it('stops passcode guessing after a few wrong tries, from that device only', async () => {
+    const { createRateLimiter } = await import('../server/geminiProxy.js');
+    const guessLimiter = createRateLimiter({ limit: 2, windowMs: 60_000, now: () => 0 });
+    const guess = (client, authorization) => call({ client, guessLimiter, authorization });
+    expect((await guess('x', 'Bearer nope1')).status).toBe(401);
+    expect((await guess('x', 'Bearer nope2')).status).toBe(401);
+    const third = await guess('x', 'Bearer nope3');
+    expect(third.status).toBe(429);
+    expect(third.body.error.message).toMatch(/wrong passcodes/);
+    expect((await guess('y', 'Bearer nope')).status).toBe(401);
   });
 });

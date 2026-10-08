@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // Tagging resizes the photo on a canvas, which does not exist here. Everything
 // downstream of it (the request, the retries, the parsing) is what is under test.
@@ -7,6 +7,17 @@ vi.mock('../src/lib/image.js', () => ({
 }));
 
 import { analyzeOutfitPhoto, buildCapsule, locateItem, suggestOutfit, tagPhoto, testProvider } from '../src/lib/ai.js';
+
+// Fresh storage per test: the app remembers models whose daily allowance ran
+// out, and that memory must not leak from one test into the next.
+beforeEach(() => {
+  const store = new Map();
+  vi.stubGlobal('localStorage', {
+    getItem: (key) => (store.has(key) ? store.get(key) : null),
+    setItem: (key, value) => store.set(key, String(value)),
+    removeItem: (key) => store.delete(key),
+  });
+});
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -458,10 +469,11 @@ describe('tagPhoto', () => {
     expect(calls).toHaveLength(2);
   });
 
-  it('retries the same model when no separate fallback is set', async () => {
+  it('does not ask the same model twice when there is no separate fallback', async () => {
     const calls = stubFetch(asJson({ items: [] }), asJson({ items: [TOP] }));
-    await tagPhoto(PHOTO, { provider: makeProvider({ fallbackModel: '' }) });
-    expect(calls.map((call) => call.body.model)).toEqual(['gpt-4o-mini', 'gpt-4o-mini']);
+    const result = await tagPhoto(PHOTO, { provider: makeProvider({ fallbackModel: '' }) });
+    expect(calls.map((call) => call.body.model)).toEqual(['gpt-4o-mini']);
+    expect(result.items).toEqual([]);
   });
 
   it('uses the provider’s own tagging token budget', async () => {
@@ -807,5 +819,55 @@ describe('free daily allowance used up', () => {
   it('still treats a per-minute rate limit as a short wait', async () => {
     stubFetch(failWith(429, 'Rate limit reached for requests per minute.'));
     await expect(outfitCall(makeProvider({ fallbackModel: '' }))).rejects.toThrow('Wait a minute and try again');
+  });
+});
+
+describe('remembering a used-up daily allowance', () => {
+  const QUOTA = 'Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 20\nPlease retry in 2h0m0s.';
+  const gemini = () => makeProvider({ presetId: 'gemini', label: 'Google Gemini', baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-3.6-flash', fallbackModel: 'gemini-3.8-flash' });
+
+  it('stops asking a model once its allowance is used up, and goes straight to the backup', async () => {
+    const first = stubFetch(failWith(429, QUOTA), asJson(PICK));
+    await outfitCall(gemini());
+    expect(first.map((call) => call.body.model)).toEqual(['gemini-3.6-flash', 'gemini-3.8-flash']);
+
+    const second = stubFetch(asJson(PICK));
+    await outfitCall(gemini());
+    expect(second.map((call) => call.body.model)).toEqual(['gemini-3.8-flash']);
+  });
+
+  it('makes no request at all when both models are used up, and says when they reset', async () => {
+    stubFetch(failWith(429, QUOTA));
+    await outfitCall(gemini()).catch(() => {});
+    const calls = stubFetch(asJson(PICK));
+    const error = await outfitCall(gemini()).catch((caught) => caught);
+    expect(calls).toHaveLength(0);
+    expect(error.message).toMatch(/used up today's free allowance; it resets in about 2 hours/);
+    expect(error.dailyQuota).toBe(true);
+  });
+
+  it('asks again once the reset time has passed', async () => {
+    const { markExhausted, isExhausted } = await import('../src/lib/ai.js');
+    const provider = gemini();
+    markExhausted(provider, 'gemini-3.6-flash', 1000, 0);
+    expect(isExhausted(provider, 'gemini-3.6-flash', 500)).toBe(true);
+    expect(isExhausted(provider, 'gemini-3.6-flash', 1500)).toBe(false);
+  });
+
+  it('without a reset time, assumes midnight Pacific', async () => {
+    const { nextPacificMidnight } = await import('../src/lib/ai.js');
+    // 2026-10-08 20:00 UTC is 13:00 in Los Angeles (PDT), so 11 hours to midnight.
+    const now = new Date('2026-10-08T20:00:00Z');
+    expect((nextPacificMidnight(now) - now.getTime()) / 3600_000).toBeCloseTo(11);
+  });
+
+  it('a photo with nothing in it costs one look on the other model, but not if that model is used up', async () => {
+    const { markExhausted } = await import('../src/lib/ai.js');
+    const provider = gemini();
+    markExhausted(provider, 'gemini-3.8-flash', 3600_000);
+    const calls = stubFetch(asJson({ items: [] }));
+    const result = await tagPhoto(PHOTO, { provider });
+    expect(calls).toHaveLength(1);
+    expect(result.items).toEqual([]);
   });
 });

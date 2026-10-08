@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Archive, CalendarDays, CalendarRange, Camera, CloudSun, Footprints, Gem, Heart, History,
-  Layers, LayoutGrid, Lock, Plane, Plus, RefreshCw, Settings, Shirt, Shuffle, Sparkles, X,
+  ArrowLeft, ArrowRight, Layers, LayoutGrid, Lock, Plane, Plus, RefreshCw, Settings, Shirt, Shuffle, Sparkles, X,
 } from 'lucide-react';
 import {
   MAX_ZOOM,
@@ -17,6 +17,7 @@ import {
   deriveFeedback,
   filterWardrobeForOutfit,
   isAvailable,
+  isRecentlyWorn,
   isCompleteOutfit,
   localOutfit,
   missingForCompleteOutfit,
@@ -34,7 +35,7 @@ import {
   searchPlaces,
 } from './lib/weather.js';
 import { BUILTIN_PRESET_ID, DEFAULT_PRESET_ID, PROVIDER_PRESETS, detectKeyMismatch, getPreset } from './lib/providers.js';
-import { testProvider } from './lib/ai.js';
+import { exhaustedUntil, isExhausted, testProvider, usageToday } from './lib/ai.js';
 import {
   canUseShareSheet,
   isIosStandalone,
@@ -47,12 +48,16 @@ import {
   addProvider,
   deleteProvider,
   getActiveProviderId,
+  getLastBackupAt,
   getOutfitPreferences,
   getProviders,
   getRepeatDays,
   getWeatherLocation,
   hasAnyProvider,
   setActiveProviderId,
+  setLastBackupAt,
+  shouldNudgeBackup,
+  snoozeBackupNudge,
   setOutfitPreferences,
   setRepeatDays,
   setWeatherLocation,
@@ -180,9 +185,6 @@ function localDate() {
   return new Date(now.getTime() - offset).toISOString().slice(0, 10);
 }
 
-function isPastOrToday(dateString) {
-  return Boolean(dateString) && dateString <= localDate();
-}
 
 function formatDate(value) {
   if (!value) return 'Never worn';
@@ -487,6 +489,14 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
   const [photoCheckOpen, setPhotoCheckOpen] = useState(false);
   // "Love it" / "never again" records, turned into what suggestions use.
   const feedback = useMemo(() => deriveFeedback(outfitRecords, items), [outfitRecords, items]);
+  // How many times each piece has been worn, for the wardrobe's sorting.
+  const wornCounts = useMemo(() => {
+    const counts = new Map();
+    outfitRecords.filter((record) => record.status === 'worn').forEach((record) => {
+      record.itemIds.forEach((id) => counts.set(id, (counts.get(id) || 0) + 1));
+    });
+    return counts;
+  }, [outfitRecords]);
 
   const changeWeatherLocation = (location) => {
     setWeatherLocation(location);
@@ -790,6 +800,30 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
     }
   };
 
+  /** Adds common basics from the first-run guide, each with a drawn stand-in photo. */
+  const quickAddBasics = async (basics) => {
+    try {
+      const groups = await Promise.all(basics.map(async (basic) => {
+        const blob = await drawBasic(basic);
+        const file = new File([blob], `${basic.key}.jpg`, { type: 'image/jpeg' });
+        const sourcePhotoId = uid();
+        return {
+          file,
+          sourcePhotoId,
+          items: [normalizeItem({
+            id: uid(), sourcePhotoId, photo: file, category: basic.category, colors: basic.colors,
+            styleTags: basic.styleTags, seasons: basic.seasons, notes: basic.label,
+          })],
+        };
+      }));
+      const stored = services.savePhotoItems ? await services.savePhotoItems(groups) : groups.flatMap((group) => group.items);
+      setItems((current) => [...(stored || []).map(normalizeItem), ...current]);
+      setToast(`${plural(basics.length, 'piece')} added. Today is ready.`);
+    } catch (error) {
+      setToast(error?.message || 'Those pieces could not be added.');
+    }
+  };
+
   /** Marks pieces out of rotation (or back in), from the wardrobe or the editor. */
   const setAvailability = (ids, reason) => bulkUpdateWardrobe(ids, { unavailable: reason || '' });
 
@@ -853,9 +887,6 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
           <span className="brand-mark">◐</span>
           <span>Outfit Picker</span>
         </button>
-        <button className="header-action" type="button" onClick={() => goToTab('upload')} aria-label="Add clothes">
-          <span aria-hidden="true"><Plus /></span>
-        </button>
       </header>
 
       <main className="app-content">
@@ -873,6 +904,7 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
             onBulkDelete={bulkDeleteWardrobe}
             onBuildOutfit={setBuildingItemIds}
             onSetAvailability={setAvailability}
+            wornCounts={wornCounts}
           />
         )}
         {activeTab === 'upload' && (
@@ -898,6 +930,12 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
             feedback={feedback}
             weatherLocation={weatherLocation}
             isLoading={isLoading}
+            onOpenSettings={() => goToTab('settings')}
+            onQuickAdd={quickAddBasics}
+            onGoToBackup={() => {
+              goToTab('settings');
+              setTimeout(() => document.getElementById('backup')?.scrollIntoView({ block: 'start' }), 60);
+            }}
           />
         )}
         {activeTab === 'journal' && (
@@ -1008,21 +1046,44 @@ function NavButton({ icon, label, active, onClick }) {
   );
 }
 
+// "Not worn in a while" means this many days, or never.
+const STALE_DAYS = 30;
+
 function WardrobeView({
   items, blobUrls, onOpenItem, onAdd, onSuggest, isLoading,
-  mode, onSetMode, onBulkUpdate, onBulkDelete, onBuildOutfit, onSetAvailability,
+  mode, onSetMode, onBulkUpdate, onBulkDelete, onBuildOutfit, onSetAvailability, wornCounts = new Map(),
 }) {
   const [filter, setFilter] = useState('all');
+  const [query, setQuery] = useState('');
+  const [sort, setSort] = useState('newest');
   const [selectedIds, setSelectedIds] = useState([]);
   const [bulkTag, setBulkTag] = useState('');
   const [bulkSeason, setBulkSeason] = useState(SEASON_WEATHER_VALUES[0]);
   const [bulkAvailability, setBulkAvailability] = useState('laundry');
   const unavailableCount = items.filter((item) => !isAvailable(item)).length;
+  const staleCount = items.filter((item) => isAvailable(item) && !isRecentlyWorn(item.lastWornDate, STALE_DAYS)).length;
   const filteredItems = useMemo(() => {
-    if (filter === 'all') return items;
-    if (filter === 'unavailable') return items.filter((item) => !isAvailable(item));
-    return items.filter((item) => item.category === filter);
-  }, [filter, items]);
+    let shown = items;
+    if (filter === 'unavailable') shown = shown.filter((item) => !isAvailable(item));
+    else if (filter === 'stale') shown = shown.filter((item) => isAvailable(item) && !isRecentlyWorn(item.lastWornDate, STALE_DAYS));
+    else if (filter !== 'all') shown = shown.filter((item) => item.category === filter);
+
+    // Every word has to match somewhere: "navy jumper" finds the navy jumper.
+    const words = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    if (words.length) {
+      shown = shown.filter((item) => {
+        const text = [displayCategory(item.category), item.category, ...item.colors, ...item.styleTags, ...item.seasons, item.notes].join(' ').toLowerCase();
+        return words.every((word) => text.includes(word));
+      });
+    }
+
+    const worn = (item) => wornCounts.get(item.id) || 0;
+    const lastWorn = (item) => item.lastWornDate || '';
+    if (sort === 'least-worn') return [...shown].sort((a, b) => worn(a) - worn(b) || lastWorn(a).localeCompare(lastWorn(b)));
+    if (sort === 'most-worn') return [...shown].sort((a, b) => worn(b) - worn(a));
+    if (sort === 'longest') return [...shown].sort((a, b) => lastWorn(a).localeCompare(lastWorn(b)));
+    return shown;
+  }, [filter, items, query, sort, wornCounts]);
 
   // The filter is only offered while something is out; don't strand it.
   useEffect(() => {
@@ -1089,6 +1150,18 @@ function WardrobeView({
         </>
       )}
 
+      {items.length > 0 && (
+        <div className="wardrobe-tools">
+          <input type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search colour, type, notes…" aria-label="Search your wardrobe" />
+          <select value={sort} onChange={(event) => setSort(event.target.value)} aria-label="Sort">
+            <option value="newest">Newest</option>
+            <option value="least-worn">Least worn</option>
+            <option value="most-worn">Most worn</option>
+            <option value="longest">Longest since worn</option>
+          </select>
+        </div>
+      )}
+
       <div className="filter-scroll" aria-label="Filter by category">
         <FilterChip label="All" active={filter === 'all'} count={items.length} onClick={() => setFilter('all')} />
         {CATEGORIES.map((category) => (
@@ -1100,6 +1173,9 @@ function WardrobeView({
             onClick={() => setFilter(category)}
           />
         ))}
+        {staleCount > 0 && (
+          <FilterChip label={`Not worn in ${STALE_DAYS} days`} active={filter === 'stale'} count={staleCount} onClick={() => setFilter('stale')} />
+        )}
         {unavailableCount > 0 && (
           <FilterChip label="Out of rotation" active={filter === 'unavailable'} count={unavailableCount} onClick={() => setFilter('unavailable')} />
         )}
@@ -1144,7 +1220,7 @@ function WardrobeView({
           )}
         </div>
       ) : (
-        <EmptyWardrobe filter={filter} onAdd={onAdd} />
+        <EmptyWardrobe filter={filter} onAdd={onAdd} hasItems={items.length > 0} />
       )}
 
       {mode === 'edit' && selectedIds.length > 0 && (
@@ -1197,7 +1273,10 @@ function FilterChip({ label, count, active, onClick }) {
   );
 }
 
-function EmptyWardrobe({ filter, onAdd }) {
+function EmptyWardrobe({ filter, onAdd, hasItems }) {
+  if (hasItems) {
+    return <p className="inline-note">Nothing matches. Try another search or filter.</p>;
+  }
   const filtered = filter !== 'all';
   return (
     <div className="empty-state wardrobe-empty">
@@ -1689,8 +1768,10 @@ function OutfitLook({ items, blobUrls, className = '' }) {
 
 function OutfitView({
   items, blobUrls, repeatDays, onSuggest, onWearOutfit, onRateOutfit, onAdd, onBuildOwn, onOpenPhotoCheck, onToast,
-  feedback = EMPTY_FEEDBACK, weatherLocation, isLoading = false,
+  feedback = EMPTY_FEEDBACK, weatherLocation, isLoading = false, onGoToBackup, onOpenSettings, onQuickAdd,
 }) {
+  const [showBackupNudge, setShowBackupNudge] = useState(() => shouldNudgeBackup(items.length));
+  useEffect(() => { setShowBackupNudge(shouldNudgeBackup(items.length)); }, [items.length]);
   const [preferences, setPreferences] = useState(() => ({
     weather: 'mild',
     temperature: 20,
@@ -1906,13 +1987,8 @@ function OutfitView({
   if (!items.length && !isLoading) {
     return (
       <section className="screen outfit-screen empty-outfit">
-        <div className="screen-heading"><div><p className="eyebrow">OUTFIT PICKER</p><h1>Let’s get dressed</h1></div></div>
-        <div className="empty-state">
-          <div className="empty-illustration warm" aria-hidden="true"><span><Sparkles /></span><span><Shirt /></span><span><TrousersIcon /></span></div>
-          <h2>Add a few pieces first</h2>
-          <p>Once you have added some clothes, I can start assembling outfits.</p>
-          <button className="primary-button" type="button" onClick={onAdd}>Add clothes <span>→</span></button>
-        </div>
+        <div className="screen-heading"><div><p className="eyebrow">WELCOME</p><h1>Let’s set up your wardrobe</h1><p className="heading-copy">Three steps, and Today starts dressing you.</p></div></div>
+        <FirstRunGuide onAdd={onAdd} onOpenSettings={onOpenSettings} onQuickAdd={onQuickAdd} />
       </section>
     );
   }
@@ -1929,6 +2005,16 @@ function OutfitView({
           <h1>{isAi ? 'Styled for you' : 'Your outfit today'}</h1>
         </div>
       </div>
+
+      {showBackupNudge && (
+        <div className="backup-nudge">
+          <p><strong>Your wardrobe is only saved on this phone.</strong> {getLastBackupAt() ? `Last backup ${daysAgo(getLastBackupAt())}.` : 'It has never been backed up.'} Phones can clear website data.</p>
+          <div>
+            <button className="primary-button compact" type="button" onClick={onGoToBackup}>Back up now</button>
+            <button className="text-button" type="button" onClick={() => { snoozeBackupNudge(7); setShowBackupNudge(false); }}>Later</button>
+          </div>
+        </div>
+      )}
 
       {today && !weatherTouched && (
         <p className="forecast-line"><CloudSun className="inline-icon" aria-hidden="true" /> {weatherLocation.shortName}: {describeDay(today)}{today.rain ? ' — rain likely' : ''}</p>
@@ -2024,7 +2110,164 @@ function ChoiceButton({ active, children, onClick }) {
   return <button className={`choice-button ${active ? 'is-selected' : ''}`} type="button" onClick={onClick}>{children}</button>;
 }
 
+// Everyday pieces most wardrobes have, for a quick start before any photos.
+const BASICS = [
+  { key: 'white-tee', label: 'White T-shirt', category: 'top', colors: ['white'], styleTags: ['casual', 'minimal'], seasons: ['all-season'], fill: '#fbfbfb' },
+  { key: 'black-tee', label: 'Black T-shirt', category: 'top', colors: ['black'], styleTags: ['casual', 'minimal'], seasons: ['all-season'], fill: '#26262a' },
+  { key: 'white-shirt', label: 'White shirt', category: 'top', colors: ['white'], styleTags: ['smart casual', 'work'], seasons: ['all-season'], fill: '#f4f6fa' },
+  { key: 'navy-jumper', label: 'Navy jumper', category: 'top', colors: ['navy'], styleTags: ['casual', 'smart casual'], seasons: ['autumn', 'winter', 'cool'], fill: '#22304f' },
+  { key: 'blue-jeans', label: 'Blue jeans', category: 'bottom', colors: ['blue', 'denim'], styleTags: ['casual'], seasons: ['all-season'], fill: '#5b7fae' },
+  { key: 'black-jeans', label: 'Black jeans', category: 'bottom', colors: ['black'], styleTags: ['casual', 'smart casual'], seasons: ['all-season'], fill: '#1d1d20' },
+  { key: 'beige-chinos', label: 'Beige chinos', category: 'bottom', colors: ['beige'], styleTags: ['smart casual', 'work'], seasons: ['spring', 'summer', 'mild'], fill: '#d6c19c' },
+  { key: 'white-sneakers', label: 'White sneakers', category: 'shoes', colors: ['white'], styleTags: ['casual', 'minimal'], seasons: ['all-season'], fill: '#fdfdfd' },
+  { key: 'black-boots', label: 'Black boots', category: 'shoes', colors: ['black'], styleTags: ['smart casual'], seasons: ['autumn', 'winter', 'cold', 'rainy'], fill: '#222' },
+  { key: 'denim-jacket', label: 'Denim jacket', category: 'outerwear', colors: ['denim', 'blue'], styleTags: ['casual'], seasons: ['spring', 'autumn', 'cool'], fill: '#6f8fbd' },
+];
+
+// A plain drawn stand-in, so a basic added without a photo still has
+// something to show (and works like any other photo: crops, the look, etc.).
+function drawBasic({ category, fill }) {
+  const canvas = document.createElement('canvas');
+  canvas.width = 360;
+  canvas.height = 440;
+  const g = canvas.getContext('2d');
+  g.fillStyle = '#f1ede6';
+  g.fillRect(0, 0, 360, 440);
+  g.fillStyle = fill;
+  g.strokeStyle = '#6b665f';
+  g.lineWidth = 4;
+  g.lineJoin = 'round';
+  const shapes = {
+    top: [[105, 80], [255, 80], [325, 150], [285, 185], [265, 160], [265, 370], [95, 370], [95, 160], [75, 185], [35, 150]],
+    outerwear: [[95, 60], [265, 60], [335, 170], [290, 200], [272, 175], [272, 400], [88, 400], [88, 175], [70, 200], [25, 170]],
+    bottom: [[105, 50], [255, 50], [280, 400], [195, 400], [180, 170], [165, 400], [80, 400]],
+    shoes: [[50, 270], [170, 245], [300, 300], [300, 345], [50, 345]],
+  };
+  const points = shapes[category] || shapes.top;
+  g.beginPath();
+  points.forEach(([x, y], index) => (index ? g.lineTo(x, y) : g.moveTo(x, y)));
+  g.closePath();
+  g.fill();
+  g.stroke();
+  return new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.88));
+}
+
+/**
+ * The first screen for an empty wardrobe: the three things that make the app
+ * work, in order, plus a quick start from common basics so Today has
+ * something to dress you in before any photos are taken.
+ */
+function FirstRunGuide({ onAdd, onOpenSettings, onQuickAdd }) {
+  const [chosen, setChosen] = useState([]);
+  const [isAdding, setIsAdding] = useState(false);
+  const hasAi = hasAnyProvider();
+  const hasWeather = Boolean(getWeatherLocation());
+  const toggle = (key) => setChosen((current) => (current.includes(key) ? current.filter((entry) => entry !== key) : [...current, key]));
+
+  const addBasics = async () => {
+    setIsAdding(true);
+    try {
+      await onQuickAdd(BASICS.filter((basic) => chosen.includes(basic.key)));
+      setChosen([]);
+    } finally {
+      setIsAdding(false);
+    }
+  };
+
+  return (
+    <div className="first-run">
+      <ol className="first-run-steps">
+        <li className={hasAi ? 'is-done' : ''}>
+          <span className="step-mark" aria-hidden="true">{hasAi ? '✓' : '1'}</span>
+          <div>
+            <strong>Connect the AI</strong>
+            <small>{hasAi ? 'Connected.' : 'For tagging photos and styling. Enter the built-in AI passcode in Settings.'}</small>
+          </div>
+          {!hasAi && <button className="secondary-button compact" type="button" onClick={onOpenSettings}>Settings</button>}
+        </li>
+        <li>
+          <span className="step-mark" aria-hidden="true">2</span>
+          <div>
+            <strong>Add photos of your clothes</strong>
+            <small>One piece, a pile, or a mirror selfie. Each piece is found and cropped for you.</small>
+          </div>
+          <button className="primary-button compact" type="button" onClick={onAdd}>Add</button>
+        </li>
+        <li className={hasWeather ? 'is-done' : ''}>
+          <span className="step-mark" aria-hidden="true">{hasWeather ? '✓' : '3'}</span>
+          <div>
+            <strong>Live weather <em>(optional)</em></strong>
+            <small>{hasWeather ? 'On.' : 'So Today dresses you for the forecast.'}</small>
+          </div>
+          {!hasWeather && <button className="secondary-button compact" type="button" onClick={onOpenSettings}>Turn on</button>}
+        </li>
+      </ol>
+
+      <section className="quick-basics">
+        <h3>Or start with the basics you own</h3>
+        <p>Tap what you have. Each gets a simple drawing for now; add real photos whenever you like.</p>
+        <div className="chip-row">
+          {BASICS.map((basic) => (
+            <ChoiceButton key={basic.key} active={chosen.includes(basic.key)} onClick={() => toggle(basic.key)}>{basic.label}</ChoiceButton>
+          ))}
+        </div>
+        <button className="primary-button full-width" type="button" disabled={!chosen.length || isAdding} onClick={addBasics}>
+          {isAdding ? <><span className="button-spinner" /> Adding…</> : chosen.length ? `Add ${plural(chosen.length, 'piece')}` : 'Choose a few above'}
+        </button>
+      </section>
+    </div>
+  );
+}
+
 const JOURNAL_BADGES = { worn: 'Worn', planned: 'Planned', loved: 'Loved' };
+
+function mondayOf(dateString) {
+  const day = new Date(`${dateString}T12:00:00`).getDay();
+  return addDays(dateString, -((day + 6) % 7));
+}
+
+/**
+ * Mon-Sun at a glance: a thumbnail of what was worn (solid) or planned
+ * (dashed) each day. Tapping a day shows just that day's entries below.
+ */
+function WeekStrip({ outfitRecords, itemsById, blobUrls, selectedDate, onSelectDate }) {
+  const [weekStart, setWeekStart] = useState(() => mondayOf(localDate()));
+  const today = localDate();
+  const days = Array.from({ length: 7 }, (unused, index) => addDays(weekStart, index));
+  const forDay = (date) => outfitRecords.find((record) => record.date === date && record.status === 'worn')
+    || outfitRecords.find((record) => record.date === date && record.status === 'planned');
+  const label = new Intl.DateTimeFormat(undefined, { day: 'numeric', month: 'short' });
+
+  return (
+    <div className="week-strip">
+      <div className="week-strip-header">
+        <button className="icon-text-button" type="button" onClick={() => setWeekStart(addDays(weekStart, -7))} aria-label="Previous week"><ArrowLeft aria-hidden="true" /></button>
+        <strong>{weekStart === mondayOf(today) ? 'This week' : `Week of ${label.format(new Date(`${weekStart}T12:00:00`))}`}</strong>
+        <button className="icon-text-button" type="button" onClick={() => setWeekStart(addDays(weekStart, 7))} aria-label="Next week"><ArrowRight aria-hidden="true" /></button>
+      </div>
+      <div className="week-strip-days">
+        {days.map((date) => {
+          const record = forDay(date);
+          const first = record?.itemIds.map((id) => itemsById.get(id)).find(Boolean);
+          return (
+            <button
+              key={date}
+              type="button"
+              className={`week-day ${date === today ? 'is-today' : ''} ${record ? `has-${record.status}` : ''} ${selectedDate === date ? 'is-selected' : ''}`}
+              onClick={() => onSelectDate(selectedDate === date ? '' : date)}
+              aria-pressed={selectedDate === date}
+              aria-label={`${weekday(date)} ${formatDate(date)}${record ? `, ${JOURNAL_BADGES[record.status].toLowerCase()}` : ''}`}
+            >
+              <span>{weekday(date).slice(0, 2)}</span>
+              <strong>{Number(date.slice(8))}</strong>
+              {first ? <Photo item={first} blobUrls={blobUrls} className="week-day-photo" alt="" /> : <span className="week-day-empty" />}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
 
 function JournalView({
   items, blobUrls, outfitRecords, onPlanOutfit, onDeleteOutfitRecord, onAllowAgain, onOpenPhotoCheck,
@@ -2036,6 +2279,8 @@ function JournalView({
   const itemsById = useMemo(() => new Map(items.map((item) => [item.id, item])), [items]);
   const outfitThumbs = (record) => record.itemIds.map((id) => itemsById.get(id)).filter(Boolean);
   const visibleRecords = outfitRecords.filter((record) => record.status !== 'rejected');
+  const [dayFilter, setDayFilter] = useState('');
+  const shownRecords = dayFilter ? visibleRecords.filter((record) => record.date === dayFilter) : visibleRecords;
   const ruledOut = outfitRecords.filter((record) => record.status === 'rejected');
 
   if (!items.length) {
@@ -2076,9 +2321,15 @@ function JournalView({
             <button className="secondary-button" type="button" onClick={onPlanOutfit}><Plus className="inline-icon" aria-hidden="true" /> Plan an outfit</button>
             <button className="secondary-button" type="button" onClick={onOpenPhotoCheck}><Camera className="inline-icon" aria-hidden="true" /> Log from a photo</button>
           </div>
-          {visibleRecords.length ? (
+          <WeekStrip outfitRecords={visibleRecords} itemsById={itemsById} blobUrls={blobUrls} selectedDate={dayFilter} onSelectDate={setDayFilter} />
+          {dayFilter && (
+            <p className="day-filter-note">
+              Showing {weekday(dayFilter)} {formatDate(dayFilter)} · <button className="text-button" type="button" onClick={() => setDayFilter('')}>Show all</button>
+            </p>
+          )}
+          {shownRecords.length ? (
             <div className="journal-list">
-              {visibleRecords.map((record) => (
+              {shownRecords.map((record) => (
                 <div className="journal-row" key={record.id}>
                   <div className="journal-row-photos">
                     {outfitThumbs(record).slice(0, 4).map((item) => (
@@ -2095,7 +2346,7 @@ function JournalView({
               ))}
             </div>
           ) : (
-            <p className="inline-note">Nothing logged yet. Wear a suggested outfit, log one from a photo, or plan one ahead.</p>
+            <p className="inline-note">{dayFilter ? 'Nothing logged or planned that day.' : 'Nothing logged yet. Wear a suggested outfit, log one from a photo, or plan one ahead.'}</p>
           )}
 
           {ruledOut.length > 0 && (
@@ -2822,6 +3073,13 @@ function SaveLookModal({ items, blobUrls, itemIds, onClose, onSave }) {
   );
 }
 
+function daysAgo(timestamp) {
+  const days = Math.floor((Date.now() - timestamp) / 86_400_000);
+  if (days <= 0) return 'today';
+  if (days === 1) return 'yesterday';
+  return `${days} days ago`;
+}
+
 const formatMegabytes = (bytes) => `${(bytes / 1_048_576).toFixed(1)} MB`;
 
 function downloadBlob(blob, fileName) {
@@ -2845,6 +3103,7 @@ function BackupCard({ exportBackup, onRestore, onToast, dataKey }) {
   const useShareSheet = useMemo(() => isIosStandalone() && canUseShareSheet(), []);
   const [prepared, setPrepared] = useState(null);
   const [isBusy, setIsBusy] = useState(false);
+  const [lastBackup, setLastBackup] = useState(getLastBackupAt);
 
   // Clearing, restoring or editing the wardrobe makes a prepared file stale.
   useEffect(() => { setPrepared(null); }, [dataKey]);
@@ -2859,6 +3118,8 @@ function BackupCard({ exportBackup, onRestore, onToast, dataKey }) {
     try {
       const { blob, fileName, counts } = await build();
       downloadBlob(blob, fileName);
+      setLastBackupAt();
+      setLastBackup(Date.now());
       onToast(`Backup saved: ${describeCounts(counts)} (${formatMegabytes(blob.size)}).`);
     } catch (error) {
       onToast(error?.message || 'The backup could not be made.');
@@ -2886,6 +3147,10 @@ function BackupCard({ exportBackup, onRestore, onToast, dataKey }) {
     const { counts } = prepared;
     shareFile(prepared.shareable)
       .then((outcome) => {
+        if (outcome === 'shared') {
+          setLastBackupAt();
+          setLastBackup(Date.now());
+        }
         onToast(outcome === 'shared'
           ? `Backup sent to the share sheet: ${describeCounts(counts)}.`
           : 'Cancelled. Your backup is still ready if you want to save it.');
@@ -2896,8 +3161,8 @@ function BackupCard({ exportBackup, onRestore, onToast, dataKey }) {
   };
 
   return (
-    <section className="settings-card">
-      <div className="settings-card-heading"><span className="settings-icon" aria-hidden="true"><Archive /></span><div><h2>Backup</h2><p>Your wardrobe lives only in this browser. Save a backup file now and then, and restore it here or on another device. Keys are never included.</p></div></div>
+    <section className="settings-card" id="backup">
+      <div className="settings-card-heading"><span className="settings-icon" aria-hidden="true"><Archive /></span><div><h2>Backup</h2><p>Your wardrobe lives only in this browser. Save a backup file now and then, and restore it here or on another device. Keys are never included.</p><p className={`backup-age ${!lastBackup || Date.now() - lastBackup > 30 * 86_400_000 ? 'is-stale' : ''}`}>{lastBackup ? `Last backup: ${daysAgo(lastBackup)}.` : 'No backup saved from this device yet.'}</p></div></div>
       <div className="backup-actions">
         {!useShareSheet && (
           <button className="secondary-button" type="button" disabled={isBusy} onClick={downloadBackup}>{isBusy ? 'Preparing…' : 'Download backup'}</button>
@@ -3080,6 +3345,7 @@ function SettingsView({ onClear, exportBackup, onRestore, onToast, dataKey, weat
                     <span>
                       <strong>{item.label}</strong>
                       <small>{item.model || 'no model set'} · {JSON_MODE_LABELS[item.jsonMode] || item.jsonMode}</small>
+                      <ProviderUsage provider={item} />
                     </span>
                   </label>
                   <div className="provider-row-actions">
@@ -3168,6 +3434,31 @@ function BuiltInAiSetup({ onConnected }) {
       </div>
       {status && <p className="key-warning" role="alert">{status}</p>}
     </form>
+  );
+}
+
+/**
+ * Today's request count for a provider, and for Gemini (whose free tier was
+ * seen capping this app's main model at 20 a day) an estimate of what's left
+ * and when a used-up model resets. Requests are counted on this device only.
+ */
+function ProviderUsage({ provider }) {
+  const used = usageToday(provider);
+  const until = exhaustedUntil(provider);
+  const isGemini = ['gemini', BUILTIN_PRESET_ID].includes(provider.presetId);
+  if (until) {
+    const hours = Math.max(1, Math.round((until - Date.now()) / 3600_000));
+    const hasBackup = provider.fallbackModel && provider.fallbackModel !== provider.model;
+    const bothOut = !hasBackup || (isExhausted(provider, provider.model) && isExhausted(provider, provider.fallbackModel));
+    return bothOut
+      ? <small className="usage-line is-out">Free allowance used up · resets in about {hours}h</small>
+      : <small className="usage-line is-out">One model is used up for today, so the other is answering · resets in about {hours}h</small>;
+  }
+  if (!used) return isGemini ? <small className="usage-line">No AI requests yet today · free tier allows about 20 a day per model</small> : null;
+  return (
+    <small className="usage-line">
+      {plural(used, 'AI request')} today{isGemini ? ` · roughly ${Math.max(0, 40 - used)} left across both models` : ''}
+    </small>
   );
 }
 
