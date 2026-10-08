@@ -242,3 +242,24 @@ describe('when the browser will not let the app use storage', () => {
     expect(() => addProvider({ presetId: 'openai', baseUrl: 'https://a.test/v1', apiKey: 'k', model: 'm' })).not.toThrow();
   });
 });
+
+describe('moving saved providers off a retired default model', () => {
+  it('upgrades a built-in provider still on the old default, and leaves a hand-set model alone', async () => {
+    const store = new Map();
+    vi.stubGlobal('localStorage', {
+      getItem: (key) => (store.has(key) ? store.get(key) : null),
+      setItem: (key, value) => store.set(key, String(value)),
+      removeItem: (key) => store.delete(key),
+    });
+    store.set('outfit-picker-providers-migrated', '1');
+    store.set('outfit-picker-providers', JSON.stringify([
+      { id: 'a', presetId: 'builtin', model: 'gemini-3.6-flash', fallbackModel: 'gemini-3.8-flash' },
+      { id: 'b', presetId: 'gemini', model: 'gemini-3.7-flash', fallbackModel: 'gemini-3.8-flash' },
+      { id: 'c', presetId: 'openai', model: 'gpt-4o-mini', fallbackModel: 'gpt-4o' },
+    ]));
+    const { getProviders } = await import('../src/lib/settings.js');
+    expect(getProviders().map((provider) => provider.model)).toEqual(['gemini-3.5-flash-lite', 'gemini-3.7-flash', 'gpt-4o-mini']);
+    expect(JSON.parse(store.get('outfit-picker-providers'))[0].model).toBe('gemini-3.5-flash-lite');
+    vi.unstubAllGlobals();
+  });
+});

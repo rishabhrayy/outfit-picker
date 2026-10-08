@@ -871,3 +871,28 @@ describe('remembering a used-up daily allowance', () => {
     expect(result.items).toEqual([]);
   });
 });
+
+describe('tidying what Flash-Lite finds in a mirror photo', () => {
+  it('merges a left and right shoe into one pair, and drops the phone', async () => {
+    const { tidyDetectedItems } = await import('../src/lib/ai.js');
+    const shoe = (x) => ({ category: 'shoes', colors: ['white'], styleTags: [], seasons: [], notes: 'white sneakers', crop: { x, y: 82, width: 19, height: 10, unit: 'percent' } });
+    const items = tidyDetectedItems([
+      { category: 'top', colors: ['navy'], styleTags: [], seasons: [], notes: 'navy t-shirt', crop: null },
+      shoe(31),
+      shoe(50),
+      { category: 'accessory', colors: ['black'], styleTags: [], seasons: [], notes: 'black phone', crop: null },
+      { category: 'accessory', colors: ['brown'], styleTags: [], seasons: [], notes: 'leather belt', crop: null },
+    ]);
+    expect(items.map((item) => item.notes)).toEqual(['navy t-shirt', 'white sneakers', 'leather belt']);
+    expect(items[1].crop).toMatchObject({ x: 31, width: 38 });
+  });
+
+  it('keeps two genuinely different pairs of shoes apart', async () => {
+    const { tidyDetectedItems } = await import('../src/lib/ai.js');
+    const items = tidyDetectedItems([
+      { category: 'shoes', colors: ['white'], styleTags: [], seasons: [], notes: 'white sneakers', crop: null },
+      { category: 'shoes', colors: ['brown'], styleTags: [], seasons: [], notes: 'brown boots', crop: null },
+    ]);
+    expect(items).toHaveLength(2);
+  });
+});

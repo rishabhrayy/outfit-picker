@@ -27,7 +27,7 @@ Settings manages a list of providers rather than one fixed choice: add one from 
 | --- | --- | --- | --- |
 | Anthropic (Claude) | `claude-haiku-4-5-20251001` | `claude-sonnet-5` | platform.claude.com/settings/keys |
 | OpenAI | `gpt-4o-mini` | `gpt-4o` | platform.openai.com/api-keys |
-| Google Gemini | `gemini-3.6-flash` | `gemini-3.8-flash` | aistudio.google.com/apikey |
+| Google Gemini (and the built-in AI) | `gemini-3.5-flash-lite` | `gemini-3.8-flash` | aistudio.google.com/apikey |
 | Groq | Qwen 3.6 27B | Qwen 3.8 27B | console.groq.com/keys |
 | OpenRouter | `openrouter/free` | — | openrouter.ai/keys |
 | Mistral, Together AI, DeepSeek, xAI | see each preset in Settings | | |
@@ -112,7 +112,7 @@ Because the site is public, a **passcode** guards that key: in **Settings > Use 
 
 To set it up on Vercel:
 
-1. Create a Gemini key at [aistudio.google.com/apikey](https://aistudio.google.com/apikey). A free-tier key (no billing on its Google Cloud project) can't run up a bill, only hit its limits, and those are small: Google's error for this app's main model gave **20 requests a day**, per model, resetting at midnight Pacific time. Every photo tagged, outfit styled, photo check or capsule is one request, sometimes two when the backup model is tried. Your exact limits are at [ai.dev/rate-limit](https://ai.dev/rate-limit). Linking a billing account lifts them (check current pricing on Google's pricing page first); the app then says plainly when the free allowance is used up, rather than calling it busy.
+1. Create a Gemini key at [aistudio.google.com/apikey](https://aistudio.google.com/apikey). A free-tier key (no billing on its Google Cloud project) can't run up a bill, only hit its limits, and they differ a lot by model: Google's error for Gemini Flash gave **20 requests a day**, per model, resetting at midnight Pacific time, while Flash-Lite's free allowance is reported at hundreds a day. So the app uses **`gemini-3.5-flash-lite` first and `gemini-3.8-flash` as the backup**. Flash-Lite was tested live before the switch: it found every piece in a mirror photo with accurate positions, styled a sensible cold-weather work outfit, and matched worn pieces to the wardrobe, each in 2-5 seconds. It is a little less careful (it listed a pair of shoes as two items and the phone as an accessory), so tagging merges a split pair and drops phones, and Flash steps in when Flash-Lite fails or finds nothing. Saved providers still on the old Flash default move over automatically; a model you set yourself is left alone. Every photo tagged, outfit styled, photo check or capsule is one request, sometimes two when the backup model is tried. Your exact limits are at [ai.dev/rate-limit](https://ai.dev/rate-limit). Linking a billing account lifts them (check current pricing on Google's pricing page first); the app then says plainly when the free allowance is used up, rather than calling it busy.
 2. In the Vercel dashboard, open the project, then **Settings > Environment Variables**, and add:
    - `GEMINI_API_KEY`: the key. Mark it **Sensitive**.
    - `APP_PASSCODE`: a long passphrase of your choosing. Mark it **Sensitive**.
@@ -180,7 +180,7 @@ npm run lint
 
 Lint (ESLint) checks for names that don't exist, code that's never used, and React hooks called conditionally; CI runs it before the tests.
 
-219 tests (Vitest, with `fake-indexeddb` standing in for the browser and a stubbed `fetch` standing in for every AI provider):
+222 tests (Vitest, with `fake-indexeddb` standing in for the browser and a stubbed `fetch` standing in for every AI provider):
 
 - **Backup**: round-trips photo bytes exactly, restores by id without duplicating or deleting, skips items whose photo is missing, never contains a key, and rejects bad files.
 - **AI requests**: what each of the four structured-output modes (strict schema, forced tool call, JSON object, plain text) actually sends and how it reads the reply; the auto-detect ladder stepping down in order, and *not* burning four calls on a rejected key or a rate limit; the retry on the stronger model (for outfits too, but never after a rejected key, a timeout or a lost connection); the Anthropic browser-access header; timeouts and cancelling; and the wording of every error message a person can hit.

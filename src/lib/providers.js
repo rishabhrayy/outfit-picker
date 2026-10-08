@@ -28,7 +28,8 @@ export const PROVIDER_PRESETS = Object.freeze([
     label: 'Built-in AI (Gemini)',
     article: 'a',
     baseUrl: '/api/gemini',
-    model: 'gemini-3.6-flash',
+    // See the Gemini preset below for why Flash-Lite leads.
+    model: 'gemini-3.5-flash-lite',
     fallbackModel: 'gemini-3.8-flash',
     // Same reasoning-model budgets as the Gemini preset below.
     taggingMaxTokens: 4000,
@@ -91,9 +92,15 @@ export const PROVIDER_PRESETS = Object.freeze([
     label: 'Google Gemini',
     article: 'a',
     baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
-    // Google's pro tier answers 429 on a standard key, so the escalation here is
-    // to a newer flash model rather than to a larger one.
-    model: 'gemini-3.6-flash',
+    // Flash-Lite leads because a free key gets hundreds of its requests a day
+    // against about 20 for Flash, which ran out in a day of real use. Tested
+    // live before switching: it found every piece in a mirror photo and where
+    // each was, styled a sensible cold-weather work outfit, and matched worn
+    // pieces to the wardrobe, each in 2-5s. It's a little less careful (it
+    // split a pair of shoes and listed the phone; tagPhoto now tidies both),
+    // so Flash stays as the backup for anything it fails or finds nothing in.
+    // Pro isn't on the free tier, hence Flash rather than Pro as the backup.
+    model: 'gemini-3.5-flash-lite',
     fallbackModel: 'gemini-3.8-flash',
     // Gemini 3.x reasons before it answers, and that reasoning is charged
     // against max_tokens. Too small a budget returns an empty message with
@@ -234,6 +241,16 @@ export const PROVIDER_PRESETS = Object.freeze([
     jsonMode: 'auto',
   }),
 ]);
+
+/**
+ * Defaults a preset has since moved on from. A saved provider still on the
+ * old default (never changed by hand) is moved to the new one when read; one
+ * the person set themselves is left alone.
+ */
+export const RETIRED_DEFAULT_MODELS = Object.freeze({
+  [BUILTIN_PRESET_ID]: Object.freeze({ 'gemini-3.6-flash': 'gemini-3.5-flash-lite' }),
+  gemini: Object.freeze({ 'gemini-3.6-flash': 'gemini-3.5-flash-lite' }),
+});
 
 export function getPreset(id) {
   return PROVIDER_PRESETS.find((preset) => preset.id === id) || PROVIDER_PRESETS.find((preset) => preset.id === 'custom');

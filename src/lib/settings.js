@@ -4,7 +4,7 @@
  * feature is actually used.
  */
 
-import { getPreset } from './providers.js';
+import { getPreset, RETIRED_DEFAULT_MODELS } from './providers.js';
 
 export const PROVIDERS_STORAGE_KEY = 'outfit-picker-providers';
 export const ACTIVE_PROVIDER_STORAGE_KEY = 'outfit-picker-active-provider';
@@ -125,7 +125,18 @@ function presetToProvider(preset, apiKey = '') {
  */
 export function getProviders() {
   migrateLegacyKeysIfNeeded();
-  return readList();
+  const list = readList();
+  // A provider still on a model its preset has since replaced is moved to the
+  // new default; one set by hand to anything else is left exactly as it is.
+  let changed = false;
+  const upgraded = list.map((provider) => {
+    const next = RETIRED_DEFAULT_MODELS[provider.presetId]?.[provider.model];
+    if (!next) return provider;
+    changed = true;
+    return { ...provider, model: next };
+  });
+  if (changed) writeList(upgraded);
+  return upgraded;
 }
 
 export function getProviderById(id) {

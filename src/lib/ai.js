@@ -65,6 +65,8 @@ const TAGGING_SYSTEM_PROMPT = [
   'Rules:',
   '- Ignore the background entirely. Furniture, walls, plants, bedding, other people, hangers,',
   '  packaging, phones and mirrors are not items.',
+  '- A pair of shoes, socks or gloves is ONE item, even though there are two of them; its box',
+  '  covers both. A phone held up to a mirror is never an item, not even an accessory.',
   '- Only list a garment you can actually see. Do not infer trousers that are out of frame.',
   '- Report each garment once. A two-piece set is two items; a dress is one item.',
   '- Use "dress" for dresses, jumpsuits and rompers, and "accessory" for bags, hats, scarves,',
@@ -667,6 +669,41 @@ function toReviewItem(raw) {
   };
 }
 
+// Things a model sometimes lists from a mirror photo that aren't clothes.
+const NOT_CLOTHING = /\b(phone|smartphone|iphone|mobile|camera|mirror|hanger|case)\b/i;
+
+/**
+ * Cleans up two slips seen live from Gemini Flash-Lite on a mirror photo,
+ * despite the prompt: the left and right shoe listed as two items, and the
+ * phone listed as an accessory. Two shoe entries with the same colours and
+ * description become one pair with a crop covering both.
+ */
+export function tidyDetectedItems(items) {
+  const kept = items.filter((item) => !(item.category === 'accessory' && NOT_CLOTHING.test(item.notes || '')));
+  const result = [];
+  for (const item of kept) {
+    const twin = item.category === 'shoes' && result.find((other) => other.category === 'shoes'
+      && other.notes.toLowerCase() === item.notes.toLowerCase()
+      && other.colors.join('|') === item.colors.join('|'));
+    if (!twin) {
+      result.push(item);
+      continue;
+    }
+    if (twin.crop && item.crop) {
+      const x = Math.min(twin.crop.x, item.crop.x);
+      const y = Math.min(twin.crop.y, item.crop.y);
+      twin.crop = {
+        ...twin.crop,
+        x,
+        y,
+        width: Math.max(twin.crop.x + twin.crop.width, item.crop.x + item.crop.width) - x,
+        height: Math.max(twin.crop.y + twin.crop.height, item.crop.y + item.crop.height) - y,
+      };
+    }
+  }
+  return result;
+}
+
 /**
  * Sends one photo for tagging and returns { items, model, usedFallback, jsonMode }.
  *
@@ -698,7 +735,7 @@ export async function tagPhoto(file, { provider, signal } = {}) {
       signal,
     });
     const found = Array.isArray(data?.items) ? data.items : [];
-    return { items: found.map(toReviewItem).filter(Boolean), jsonMode };
+    return { items: tidyDetectedItems(found.map(toReviewItem).filter(Boolean)), jsonMode };
   };
 
   // Same rules as every other call: a busy or broken model gets one try on the
