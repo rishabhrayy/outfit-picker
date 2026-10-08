@@ -74,6 +74,26 @@ npm run preview
 
 The production files are written to `dist`.
 
+## The built-in AI (no key in the browser)
+
+The deployed site can hold one Gemini key itself, so nobody pastes a key into the app. A small serverless route, [`api/gemini/chat/completions.js`](api/gemini/chat/completions.js) (logic in [`server/geminiProxy.js`](server/geminiProxy.js)), forwards the app's requests to Gemini with a key read from the host's environment. The key never reaches the browser.
+
+Because the site is public, a **passcode** guards that key: in **Settings > Use the built-in AI**, enter it once per device and it is checked with a real request before saving. The route also only allows the app's own two Gemini models and caps `max_tokens` at 4000, so a leaked passcode can't be pointed at anything pricier. Photos pass through the route only while one is being tagged; nothing is stored.
+
+To set it up on Vercel:
+
+1. Create a Gemini key at [aistudio.google.com/apikey](https://aistudio.google.com/apikey). A free-tier key (no billing on its Google Cloud project) can't run up a bill, only hit its rate limit.
+2. In the Vercel dashboard, open the project, then **Settings > Environment Variables**, and add:
+   - `GEMINI_API_KEY`: the key. Mark it **Sensitive**.
+   - `APP_PASSCODE`: a long passphrase of your choosing. Mark it **Sensitive**.
+   - Optional: `GEMINI_MODELS`, a comma-separated list, only if Google renames the models.
+3. Redeploy (**Deployments > ⋯ > Redeploy**). Environment variables only apply to new deployments.
+4. In the app, go to **Settings**, type the passcode under **Use the built-in AI**, and select **Connect**.
+
+Until both variables are set, the route answers "not set up yet" and refuses every request. To run it locally, put the same two variables in `.env.local` (git-ignored) and use `npm run dev`. To change the passcode, change `APP_PASSCODE`, redeploy, then remove and reconnect the built-in AI on each device.
+
+Bring-your-own-key providers below still work alongside it.
+
 ## Add an API key
 
 1. Create a personal API key with your chosen provider (see the table above for where).
@@ -123,10 +143,11 @@ A backup is built in memory as one file with the photos inside as base64, so a v
 npm test
 ```
 
-125 tests (Vitest, with `fake-indexeddb` standing in for the browser and a stubbed `fetch` standing in for every AI provider):
+139 tests (Vitest, with `fake-indexeddb` standing in for the browser and a stubbed `fetch` standing in for every AI provider):
 
 - **Backup**: round-trips photo bytes exactly, restores by id without duplicating or deleting, skips items whose photo is missing, never contains a key, and rejects bad files.
 - **AI requests**: what each of the four structured-output modes (strict schema, forced tool call, JSON object, plain text) actually sends and how it reads the reply; the auto-detect ladder stepping down in order, and *not* burning four calls on a rejected key or a rate limit; the retry on the stronger model; the Anthropic browser-access header; timeouts and cancelling; and the wording of every error message a person can hit.
+- **Built-in AI route**: a wrong or missing passcode never reaches Gemini, the server key goes to Google and the passcode doesn't, only the allowed models get through, `max_tokens` is capped, and Google rejecting the server's key (which it reports as a 400) reads as a host setup problem rather than a wrong passcode.
 - **Provider settings**: the provider list, the active-provider fallback, corrupt or blocked storage, and the move from the old one-key-per-provider storage that must never lose a saved key.
 - **Bulk edit**: adding a tag merges into each item's own tags rather than replacing them, and a season change is split back into stored season and weather.
 - **Share sheet**: iPhone home-screen detection, the JSON-then-text fallback, and that `share()` starts before anything is awaited.
@@ -186,7 +207,8 @@ The current manifest uses `/` as its start URL, so deploy it at the root of a do
 - `src/lib/settings.js` — the provider choice, per-provider API keys, and repeat window in `localStorage`.
 - `src/types.js` — the canonical record shapes and their normalizers.
 - `public/` — app icons: `icon.svg`, `icon-192.png`, `icon-512.png`, `icon-maskable-512.png`, and `apple-touch-icon.png` for iOS.
-- `vite.config.js` — Vite and PWA manifest/service-worker configuration.
+- `api/gemini/chat/completions.js` and `server/geminiProxy.js` — the built-in AI route, holding the Gemini key on the host behind a passcode.
+- `vite.config.js` — Vite and PWA manifest/service-worker configuration, plus the built-in AI route for `npm run dev`.
 
 ## Licence
 

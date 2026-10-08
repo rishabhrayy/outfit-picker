@@ -23,7 +23,7 @@
  * see ANTHROPIC_BROWSER_HOST below.
  */
 
-import { detectKeyMismatch, getPreset } from './providers.js';
+import { BUILTIN_PRESET_ID, detectKeyMismatch, getPreset } from './providers.js';
 import { normalizeDetectedItem } from '../types.js';
 import { prepareImage } from './image.js';
 
@@ -202,6 +202,12 @@ function toDisplayError(error, provider) {
 }
 
 function statusMessage(status, detail, provider) {
+  // The built-in route's "key" is a passcode, and its own 5xx messages are
+  // setup instructions ("GEMINI_API_KEY is not set"), not a passing blip.
+  if (provider.presetId === BUILTIN_PRESET_ID) {
+    if (status === 401) return 'Wrong passcode for the built-in AI. Check it in Settings.';
+    if (status >= 500 && detail) return detail;
+  }
   if (status === 401 || status === 403) {
     // Using one provider's key against another is the likeliest cause of a
     // rejected key, and a bare "key rejected" message sends people off
@@ -676,6 +682,19 @@ export async function testProvider(provider, { withVision = false } = {}) {
       visionTested: withVision,
     };
   } catch (error) {
+    // Reasoning models (Gemini 3.x) can spend this probe's 20 tokens thinking
+    // and stop before saying "OK". The key, endpoint and model all worked to
+    // get that far, which is all a connection test is asking.
+    if (error?.reason === 'length') {
+      return {
+        ok: true,
+        status: 200,
+        model: provider.model,
+        latencyMs: Date.now() - startedAt,
+        reply: '',
+        visionTested: withVision,
+      };
+    }
     const display = provider ? toDisplayError(error, provider) : error;
     return {
       ok: false,

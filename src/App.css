@@ -251,6 +251,14 @@ button { -webkit-tap-highlight-color: transparent; }
 .provider-row-radio small { font-size: 10px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .provider-row-actions { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
 
+/* Built-in AI: the passcode-only setup shown above the provider list. */
+.builtin-ai { padding: 13px; margin-bottom: 12px; border: 1px solid var(--line); border-radius: 14px; background: var(--canvas); }
+.builtin-ai h3 { margin: 0; font-size: 14px; }
+.builtin-ai p { margin: 4px 0 10px; font-size: 12px; color: var(--muted); line-height: 1.4; }
+.builtin-ai-row { display: flex; gap: 8px; }
+.builtin-ai-row input { flex: 1; min-width: 0; font-size: 16px; color: var(--ink); padding: 9px 10px; border: 1px solid var(--line); border-radius: 10px; background: white; }
+.builtin-ai-row button { flex-shrink: 0; }
+
 /* Add/edit provider form. Reuses .form-grid's field look at one column, since
    base URLs and model names need the full row width. */
 .provider-form { display: grid; gap: 11px; padding: 13px; margin-bottom: 12px; border: 1px solid var(--line); border-radius: 14px; background: var(--canvas); }

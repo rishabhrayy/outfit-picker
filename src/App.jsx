@@ -14,7 +14,7 @@ import {
   occasionKey,
   shuffleOutfit,
 } from './lib/outfit.js';
-import { DEFAULT_PRESET_ID, PROVIDER_PRESETS, detectKeyMismatch, getPreset } from './lib/providers.js';
+import { BUILTIN_PRESET_ID, DEFAULT_PRESET_ID, PROVIDER_PRESETS, detectKeyMismatch, getPreset } from './lib/providers.js';
 import { testProvider } from './lib/ai.js';
 import {
   canUseShareSheet,
@@ -1746,8 +1746,20 @@ function SettingsView({ onClear, exportBackup, onRestore, onToast, dataKey }) {
           <div><h2>AI providers</h2><p>Add any OpenAI-compatible API. Used only to tag photos and make outfit suggestions.</p></div>
         </div>
 
+        {!providers.some((item) => item.presetId === BUILTIN_PRESET_ID) && (
+          <BuiltInAiSetup
+            onConnected={(passcode) => {
+              const preset = getPreset(BUILTIN_PRESET_ID);
+              const entry = addProvider({ ...preset, presetId: preset.id, apiKey: passcode });
+              setActiveProviderId(entry.id);
+              refresh();
+              onToast('Built-in AI connected.');
+            }}
+          />
+        )}
+
         {providers.length === 0 && (
-          <p className="inline-note">No providers added yet. Add one below to turn on auto-tagging and AI outfit suggestions — everything else works without one.</p>
+          <p className="inline-note">Or bring your own key: add any provider below. Everything else in the app works without AI.</p>
         )}
 
         {providers.length > 0 && (
@@ -1818,6 +1830,48 @@ function SettingsView({ onClear, exportBackup, onRestore, onToast, dataKey }) {
 
       <section className="danger-zone"><p className="eyebrow">DEVICE DATA</p><h2>Start fresh</h2><p>This permanently removes every saved photo and wardrobe item from this browser. Your providers and keys are left alone.</p><button className="danger-button" type="button" onClick={onClear}>Clear wardrobe data</button></section>
     </section>
+  );
+}
+
+/**
+ * One-field setup for the built-in AI: the site holds the Gemini key, so all
+ * this asks for is the passcode, and it checks it with a real request before
+ * saving so a typo is caught here rather than on the first photo.
+ */
+function BuiltInAiSetup({ onConnected }) {
+  const [passcode, setPasscode] = useState('');
+  const [status, setStatus] = useState(null);
+  const [isChecking, setIsChecking] = useState(false);
+
+  const connect = async (event) => {
+    event.preventDefault();
+    const value = passcode.trim();
+    if (!value) return;
+    setIsChecking(true);
+    setStatus(null);
+    try {
+      const preset = getPreset(BUILTIN_PRESET_ID);
+      const result = await testProvider({ ...preset, id: 'builtin-draft', presetId: preset.id, apiKey: value });
+      if (result.ok) {
+        onConnected(value);
+      } else {
+        setStatus(result.message);
+      }
+    } finally {
+      setIsChecking(false);
+    }
+  };
+
+  return (
+    <form className="builtin-ai" onSubmit={connect}>
+      <h3>Use the built-in AI</h3>
+      <p>No API key needed. Enter this site's passcode once on each device.</p>
+      <div className="builtin-ai-row">
+        <input type="password" value={passcode} onChange={(event) => { setPasscode(event.target.value); setStatus(null); }} placeholder="Passcode" autoComplete="current-password" aria-label="Built-in AI passcode" />
+        <button className="primary-button" type="submit" disabled={isChecking || !passcode.trim()}>{isChecking ? 'Checking…' : 'Connect'}</button>
+      </div>
+      {status && <p className="key-warning" role="alert">{status}</p>}
+    </form>
   );
 }
 

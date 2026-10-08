@@ -17,7 +17,27 @@
 
 export const DEFAULT_PRESET_ID = 'openai';
 
+export const BUILTIN_PRESET_ID = 'builtin';
+
 export const PROVIDER_PRESETS = Object.freeze([
+  Object.freeze({
+    // This site's own route (server/geminiProxy.js), which holds a Gemini key
+    // on the host. The "key" typed here is only the site's passcode, and it is
+    // sent to this site alone, never to Google.
+    id: BUILTIN_PRESET_ID,
+    label: 'Built-in AI (Gemini)',
+    article: 'a',
+    baseUrl: '/api/gemini',
+    model: 'gemini-3.6-flash',
+    fallbackModel: 'gemini-3.8-flash',
+    // Same reasoning-model budgets as the Gemini preset below.
+    taggingMaxTokens: 4000,
+    outfitMaxTokens: 2000,
+    keyPlaceholder: 'the passcode set on Vercel',
+    keyHost: '',
+    keyPrefixes: [],
+    jsonMode: 'schema',
+  }),
   Object.freeze({
     id: 'anthropic',
     label: 'Anthropic (Claude)',

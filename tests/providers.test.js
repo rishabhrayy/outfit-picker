@@ -3,10 +3,19 @@ import { describe, expect, it } from 'vitest';
 import { detectKeyMismatch, detectPresetFromKey, getPreset, PROVIDER_PRESETS } from '../src/lib/providers.js';
 
 describe('provider presets', () => {
-  it('every preset has an https base URL, except the custom slot', () => {
+  it('every preset has an https base URL, except the custom slot and this site\'s own route', () => {
     for (const preset of PROVIDER_PRESETS) {
-      if (preset.id !== 'custom') expect(preset.baseUrl).toMatch(/^https:\/\//);
+      if (preset.id === 'custom') continue;
+      if (preset.id === 'builtin') expect(preset.baseUrl).toBe('/api/gemini');
+      else expect(preset.baseUrl).toMatch(/^https:\/\//);
     }
+  });
+
+  it('the built-in route only asks for models the server allows', async () => {
+    const { DEFAULT_ALLOWED_MODELS } = await import('../server/geminiProxy.js');
+    const builtin = getPreset('builtin');
+    expect(DEFAULT_ALLOWED_MODELS).toContain(builtin.model);
+    expect(DEFAULT_ALLOWED_MODELS).toContain(builtin.fallbackModel);
   });
 
   it('unknown ids fall back to custom', () => {

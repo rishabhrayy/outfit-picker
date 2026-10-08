@@ -292,6 +292,27 @@ describe('error messages', () => {
       .rejects.toThrow('That looks like a Groq key, but this provider is set up as OpenAI');
   });
 
+  describe('the built-in AI', () => {
+    const builtin = () => makeProvider({ presetId: 'builtin', label: 'Built-in AI (Gemini)', baseUrl: '/api/gemini', apiKey: 'passcode', model: 'gemini-3.6-flash' });
+
+    it('calls this site\'s own route, with the passcode as the bearer token', async () => {
+      const calls = stubFetch(asJson({ itemIds: ['a', 'c'], explanation: 'ok' }));
+      await outfitCall(builtin());
+      expect(calls[0].url).toBe('/api/gemini/chat/completions');
+      expect(calls[0].headers.Authorization).toBe('Bearer passcode');
+    });
+
+    it('calls a 401 a wrong passcode, not a rejected API key', async () => {
+      await expect(run(failWith(401, 'Wrong passcode for the built-in AI.'), builtin()))
+        .rejects.toThrow('Wrong passcode for the built-in AI. Check it in Settings.');
+    });
+
+    it('shows the server\'s setup instructions instead of "a temporary problem"', async () => {
+      await expect(run(failWith(503, 'The built-in AI is not set up on this site yet: GEMINI_API_KEY and APP_PASSCODE both need to be set on the host.'), builtin()))
+        .rejects.toThrow(/GEMINI_API_KEY and APP_PASSCODE/);
+    });
+  });
+
   it.each([
     ['Anthropic with its own key', { presetId: 'anthropic', label: 'Anthropic (Claude)', apiKey: 'sk-ant-abc' }],
     ['OpenRouter with its own key', { presetId: 'openrouter', label: 'OpenRouter', apiKey: 'sk-or-v1-abc' }],
@@ -539,5 +560,10 @@ describe('testProvider', () => {
     expect(noKey).toMatchObject({ ok: false });
     expect(noKey.message).toContain('Add an API key');
     expect(calls).toHaveLength(0);
+  });
+
+  it('counts a reply cut short by the tiny token budget as connected, since a reasoning model can think past 20 tokens', async () => {
+    stubFetch(chat({ content: '' }, 'length'));
+    expect(await testProvider(makeProvider())).toMatchObject({ ok: true, reply: '' });
   });
 });
