@@ -381,10 +381,13 @@ export function ProviderUsage({ provider }) {
       ? <small className="usage-line is-out">Free allowance used up · resets in about {hours}h</small>
       : <small className="usage-line is-out">One model is used up for today, so the other is answering · resets in about {hours}h</small>;
   }
-  if (!used) return isGemini ? <small className="usage-line">No AI requests yet today · free tier allows about 20 a day per model</small> : null;
+  // Google doesn't publish fixed free limits (Flash-Lite's is reported in the
+  // hundreds a day, Flash's at about 20), so this counts rather than guesses
+  // what's left, and points at the real figures.
+  if (!used) return isGemini ? <small className="usage-line">No AI requests yet today · your free limits are at ai.dev/rate-limit</small> : null;
   return (
     <small className="usage-line">
-      {plural(used, 'AI request')} today{isGemini ? ` · roughly ${Math.max(0, 40 - used)} left across both models` : ''}
+      {plural(used, 'AI request')} today{isGemini ? ' · your free limits are at ai.dev/rate-limit' : ''}
     </small>
   );
 }
