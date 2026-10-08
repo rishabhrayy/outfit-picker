@@ -58,6 +58,12 @@ The key is only needed for the two AI features. Without one you can still add ph
 
 The app opens on Today rather than the wardrobe. It shows an outfit straight away, the best local match for the live weather (if on) and the occasion and vibe you last chose, so there's nothing to answer first. **Adjust** opens the occasion, weather, vibe and "build it around a piece" choices, and any change shows a new pick immediately. **Shuffle** varies it; **AI stylist** asks the AI for a styled pick with an explanation. The outfit is laid out the way it's worn: top over bottom over shoes (or a dress over shoes) down the middle, with a layer and extras alongside, each slot shaped for its garment.
 
+The instant pick takes colour into account without any AI. Colour words map to families, and neutrals (black, white, grey, navy, denim, beige and so on) go with anything. Pieces in the same family read as tonal; a few classic clashes, such as red with orange or pink, are avoided whenever there's another option. Each piece is chosen to suit what's already on: the bottom for the top, then shoes for both, then a layer.
+
+With an empty wardrobe, Today shows a three-step setup (connect the AI, add photos, optionally live weather), ticking each off when done. There's also a quick start from everyday basics: tap the ones you own and each is added with a simple drawn stand-in photo, so Today works before any photos are taken.
+
+The Journal's **History** starts with a Monday-to-Sunday strip showing a thumbnail of what was worn or planned each day; tapping a day narrows the list to it. The wardrobe has search (every word must match, so "white shoes" finds the white shoes), sorting by newest, least worn, most worn or longest since worn, and a **Not worn in 30 days** filter.
+
 **Wear this**, **Love it**, **Never suggest this** and deleting a piece or a journal entry all show an **Undo** toast instead of asking "Are you sure?" first. A delete only really happens when the toast goes (about six seconds), or straight away if you leave the app; the others are saved immediately and Undo reverses them, including each piece's previous last-worn date. Clearing the whole wardrobe and removing an API key still ask first.
 
 ## Planning and feedback
@@ -168,7 +174,13 @@ A backup is built in memory as one file with the photos inside as base64, so a v
 npm test
 ```
 
-205 tests (Vitest, with `fake-indexeddb` standing in for the browser and a stubbed `fetch` standing in for every AI provider):
+```bash
+npm run lint
+```
+
+Lint (ESLint) checks for names that don't exist, code that's never used, and React hooks called conditionally; CI runs it before the tests.
+
+219 tests (Vitest, with `fake-indexeddb` standing in for the browser and a stubbed `fetch` standing in for every AI provider):
 
 - **Backup**: round-trips photo bytes exactly, restores by id without duplicating or deleting, skips items whose photo is missing, never contains a key, and rejects bad files.
 - **AI requests**: what each of the four structured-output modes (strict schema, forced tool call, JSON object, plain text) actually sends and how it reads the reply; the auto-detect ladder stepping down in order, and *not* burning four calls on a rejected key or a rate limit; the retry on the stronger model (for outfits too, but never after a rejected key, a timeout or a lost connection); the Anthropic browser-access header; timeouts and cancelling; and the wording of every error message a person can hit.
@@ -221,11 +233,15 @@ The current manifest uses `/` as its start URL, so deploy it at the root of a do
 | Tagging or suggestions fail immediately | Confirm that a valid API key is saved in **Settings** and that the device is online. |
 | The key is rejected | Check that the selected provider matches the key you pasted; the app warns when they disagree. Otherwise create a fresh key and check the account's billing/usage. |
 | The install option is missing | Use the deployed HTTPS URL in a supported browser; a localhost development page is not a useful installation test. |
-| Saved items disappeared | Check whether browser/site data was cleared or whether you opened the app in a different browser profile/device. Local data does not sync. |
+| Saved items disappeared | Check whether browser/site data was cleared or whether you opened the app in a different browser profile/device. Local data does not sync. Settings shows when you last backed up, and Today reminds you after 30 days. |
+| "Used up today's free allowance" | The free Gemini tier's daily limit. Settings shows today's count and when it resets; the app stops asking a used-up model until then. |
+| "Too many requests from this device" | The built-in AI route's own limit (30 per 10 minutes per address). Wait a few minutes. |
 
 ## Project structure
 
-- `src/App.jsx` — every screen, plus `src/App.css` for the styling.
+- `src/App.jsx` — the app shell: state, navigation, the handlers that save and undo, and the toast; `src/App.css` holds all the styling.
+- `src/views/` — one file per screen or sheet: `TodayView.jsx` (with the first-run guide), `WardrobeView.jsx`, `UploadView.jsx`, `JournalView.jsx` (week strip, week planner, trip packer, capsule builder), `SettingsView.jsx`, `ItemEditor.jsx`, `SaveLookModal.jsx` and `OutfitPhotoModal.jsx`.
+- `src/ui/shared.jsx` — what several screens use: photo and crop rendering, the stacked outfit look, icons, the forecast hook, and small helpers.
 - `src/services.js` — the only module that joins storage and the API to the UI.
 - `src/lib/db.js` — IndexedDB reads and writes for photos and items.
 - `src/lib/ai.js` — the AI calls (tagging, outfit suggestion, outfit photo, capsule), their prompts, and their JSON schemas.
