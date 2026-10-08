@@ -19,7 +19,9 @@ export const GEMINI_ENDPOINT = 'https://generativelanguage.googleapis.com/v1beta
 // Only these models may be requested, so a leaked passcode can't be pointed at
 // a pricier model than the app itself uses. Override with GEMINI_MODELS
 // (comma-separated) when Google renames them.
-export const DEFAULT_ALLOWED_MODELS = ['gemini-3.6-flash', 'gemini-3.8-flash'];
+// Flash-Lite is allowed too: on a free key it has a far larger daily allowance
+// (hundreds of requests, against about 20 for Flash).
+export const DEFAULT_ALLOWED_MODELS = ['gemini-3.6-flash', 'gemini-3.8-flash', 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite'];
 
 // The app asks for at most 4000; anything above that isn't the app.
 const MAX_TOKENS_CEILING = 4000;
