@@ -207,12 +207,33 @@ function toDisplayError(error, provider) {
     // Kept so callers can tell a rejected key (no point retrying) from an
     // overloaded model (worth one try on the other model).
     display.status = error.status;
+    display.dailyQuota = error.status === 429 && isDailyQuota(error.rawDetail ?? error.message);
     return display;
   }
   if (error instanceof SyntaxError) {
     return new Error(`${provider.label} returned a reply this app could not read. Try again.`);
   }
   return error instanceof Error ? error : new Error(String(error));
+}
+
+/**
+ * A free tier's daily allowance being used up (Gemini: 20 requests a day per
+ * model on a free key, seen live) is not the same as a busy minute: waiting
+ * and retrying won't help until it resets.
+ */
+function isDailyQuota(detail) {
+  return /free_tier|per ?day|perday|quota exceeded for metric/i.test(String(detail || ''));
+}
+
+/** "Please retry in 12h26.5s" -> "about 12 hours", for a human. */
+function resetsIn(detail) {
+  const match = String(detail || '').match(/retry in (?:(\d+)h)?(?:(\d+)m)?(?:([\d.]+)s)?/i);
+  if (!match) return '';
+  const hours = Number(match[1] || 0);
+  const minutes = Number(match[2] || 0);
+  if (hours >= 1) return `about ${hours + (minutes >= 30 ? 1 : 0)} hour${hours === 1 && minutes < 30 ? '' : 's'}`;
+  if (minutes >= 1) return `about ${minutes} minute${minutes === 1 ? '' : 's'}`;
+  return 'a minute';
 }
 
 function statusMessage(status, detail, provider) {
@@ -242,6 +263,10 @@ function statusMessage(status, detail, provider) {
     return detail
       ? `${provider.label} rejected that API key: ${detail}`
       : `${provider.label} rejected that API key. Check the key saved in Settings.`;
+  }
+  if (status === 429 && isDailyQuota(detail)) {
+    const when = resetsIn(detail);
+    return `${provider.label} has used up today's free allowance${when ? `; it resets in ${when}` : ' (it resets at midnight Pacific time)'}. Adding billing to the key's Google project lifts the limit.`;
   }
   if (status === 429) {
     // A free tier's per-minute rate limit and an exhausted balance both arrive
@@ -606,7 +631,18 @@ async function withFallbackModel(provider, attempt) {
     const fallbackModel = provider.fallbackModel;
     const retryable = typeof error?.status === 'number' && error.status !== 401 && error.status !== 403;
     if (!retryable || !fallbackModel || fallbackModel === provider.model) throw error;
-    return attempt(fallbackModel);
+    try {
+      return await attempt(fallbackModel);
+    } catch (fallbackError) {
+      // Main model out of today's allowance, backup busy: say both, since
+      // "busy" alone sends people to retry a model that can't answer today.
+      if (error.dailyQuota && !fallbackError.dailyQuota && typeof fallbackError.status === 'number') {
+        const combined = new Error(`${error.message} The backup model is busy right now too, so try again in a few minutes.`);
+        combined.status = fallbackError.status;
+        throw combined;
+      }
+      throw fallbackError;
+    }
   }
 }
 
@@ -788,6 +824,10 @@ const OUTFIT_PHOTO_SYSTEM_PROMPT = [
   '   is a convincing match. Match on category first, then colour, then the notes. When two',
   '   items could both be it, pick the closer one; when none really fits, use an empty string.',
   '   Never use an id that is not in the list. Ignore the room, the phone and the mirror.',
+  '   Also describe each one as a wardrobe cataloguer would, so a piece that is not in the list',
+  '   can be added: colors (one to three plain words), styleTags (two to four, such as casual,',
+  '   smart casual, relaxed), seasons and weather, and box: where it is in the photo as',
+  '   [yMin, xMin, yMax, xMax] from 0 to 1000, tight around that one item as seen in the mirror.',
   '',
   '2. Give honest, specific feedback, as a friend with a good eye would, for the occasion and',
   '   weather given. No score, rating or percentage. verdict: one plain sentence on how it',
@@ -811,8 +851,13 @@ const OUTFIT_PHOTO_SCHEMA = {
             category: { type: 'string', enum: CATEGORY_ENUM },
             description: { type: 'string' },
             itemId: { type: 'string', description: 'A wardrobe id, or an empty string if none matches.' },
+            colors: { type: 'array', items: { type: 'string' } },
+            styleTags: { type: 'array', items: { type: 'string' } },
+            seasons: { type: 'array', items: { type: 'string', enum: SEASON_ENUM } },
+            weather: { type: 'array', items: { type: 'string', enum: WEATHER_ENUM } },
+            box: { type: 'array', items: { type: 'integer' } },
           },
-          required: ['category', 'description', 'itemId'],
+          required: ['category', 'description', 'itemId', 'colors', 'styleTags', 'seasons', 'weather', 'box'],
           additionalProperties: false,
         },
       },
@@ -877,11 +922,17 @@ export async function analyzeOutfitPhoto(file, { provider, wardrobe = [], occasi
   const seen = new Set();
 
   const wearing = (Array.isArray(data?.wearing) ? data.wearing : [])
-    .map((entry) => ({
-      category: CATEGORY_ENUM.includes(entry?.category) ? entry.category : 'accessory',
-      description: text(entry?.description, 120),
-      itemId: validId(entry?.itemId),
-    }))
+    .map((entry) => {
+      // Everything needed to add it as a new wardrobe piece if it isn't one
+      // already: the same fields and crop that photo tagging produces.
+      const asPiece = toReviewItem(entry);
+      return {
+        category: CATEGORY_ENUM.includes(entry?.category) ? entry.category : 'accessory',
+        description: text(entry?.description, 120),
+        itemId: validId(entry?.itemId),
+        piece: asPiece ? { ...asPiece, notes: text(entry?.description, 120) } : null,
+      };
+    })
     // The same saved piece can't be worn twice; keep its first, likeliest match.
     .map((entry) => {
       if (!entry.itemId) return entry;

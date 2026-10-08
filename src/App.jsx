@@ -204,6 +204,26 @@ function weekday(dateString) {
 
 const isWeekend = (dateString) => [0, 6].includes(new Date(`${dateString}T12:00:00`).getDay());
 
+const BUSY_RETRY_DELAY_MS = 5000;
+
+/**
+ * Runs an AI call, and if the provider says it's busy (503) or rate-limiting
+ * (429) even after its own fallback model, waits a few seconds and tries once
+ * more. Gemini's free tier gave "high demand" on both models at once during
+ * testing, and it usually clears within seconds.
+ */
+async function retryWhenBusy(call, onWaiting) {
+  try {
+    return await call();
+  } catch (error) {
+    // A used-up daily allowance won't come back in five seconds.
+    if ((error?.status !== 503 && error?.status !== 429) || error.dailyQuota) throw error;
+    onWaiting?.();
+    await new Promise((resolve) => setTimeout(resolve, BUSY_RETRY_DELAY_MS));
+    return call();
+  }
+}
+
 // One forecast per place, reused across the Outfit and Journal screens for
 // half an hour, so switching tabs doesn't re-ask the weather service.
 const forecastCache = new Map();
@@ -937,8 +957,23 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
           analyze={services.analyzeOutfitPhoto}
           weatherLocation={weatherLocation}
           onClose={() => setPhotoCheckOpen(false)}
-          onLog={async (itemIds, verdict, onUndone) => {
-            await wearOutfit({ itemIds, date: localDate(), source: 'photo', explanation: verdict, message: 'Logged as worn today.', onUndone });
+          onLog={async ({ itemIds, newPieces = [], file, verdict, onUndone }) => {
+            // Pieces that aren't in the wardrobe yet are added from this photo
+            // first, each cropped to itself, so logging is one tap either way.
+            let addedIds = [];
+            if (newPieces.length && file) {
+              const sourcePhotoId = uid();
+              const prepared = [{ file, sourcePhotoId, items: newPieces.map((piece) => normalizeItem({ ...piece, id: uid(), sourcePhotoId, photo: file })) }];
+              const stored = services.savePhotoItems ? await services.savePhotoItems(prepared) : prepared[0].items;
+              const added = (stored || []).map(normalizeItem);
+              addedIds = added.map((item) => item.id);
+              setItems((current) => [...added, ...current]);
+            }
+            const allIds = [...itemIds, ...addedIds];
+            const message = addedIds.length
+              ? `Logged as worn today. ${plural(addedIds.length, 'new piece')} added to your wardrobe.`
+              : 'Logged as worn today.';
+            await wearOutfit({ itemIds: allIds, date: localDate(), source: 'photo', explanation: verdict, message, onUndone });
           }}
           onToast={setToast}
         />
@@ -1183,6 +1218,7 @@ function UploadView({ tagPhoto, onSaveBatch, onCancel, onToast }) {
   const [progress, setProgress] = useState({ done: 0, total: 0 });
   const [isSaving, setIsSaving] = useState(false);
   const [taggingNote, setTaggingNote] = useState('');
+  const [busyNote, setBusyNote] = useState('');
   const [mergeSelection, setMergeSelection] = useState([]);
 
   // Preview URLs are owned by this component for the life of the batch.
@@ -1258,6 +1294,47 @@ function UploadView({ tagPhoto, onSaveBatch, onCancel, onToast }) {
   const blankItem = () => normalizeItem({ id: uid(), sourcePhotoId: 'pending', category: 'top' });
 
   /**
+   * Tags one photo and records the result on its entry. A busy provider gets
+   * one more try after a short pause before the photo is marked as failed.
+   */
+  const tagEntry = async (entry) => {
+    patchEntry(entry.id, { status: 'tagging', error: '', note: '' });
+    try {
+      if (!tagPhoto) throw new Error('Add an AI provider in Settings to auto-tag.');
+      const response = await retryWhenBusy(
+        () => tagPhoto(entry.file),
+        () => setBusyNote('Google is busy. Trying this photo again in a few seconds…'),
+      );
+      setBusyNote('');
+      const found = (Array.isArray(response) ? response : response?.items) || [];
+      const items = found.map((item) => normalizeItem({ ...item, id: uid(), sourcePhotoId: 'pending' }));
+      patchEntry(entry.id, {
+        status: 'done',
+        model: response?.model || '',
+        items: items.length ? items : [blankItem()],
+        note: items.length ? '' : 'Nothing wearable was found here. Add it by hand or remove the photo.',
+      });
+      return { failed: false, found: items.length };
+    } catch (error) {
+      setBusyNote('');
+      patchEntry(entry.id, {
+        status: 'failed',
+        error: error?.message || 'Tagging failed for this photo.',
+        items: [blankItem()],
+      });
+      return { failed: true, found: 0 };
+    }
+  };
+
+  // From the review screen: tag one failed photo again without redoing the rest.
+  const retryEntry = async (entry) => {
+    const outcome = await tagEntry(entry);
+    if (!outcome.failed) {
+      setTaggingNote(outcome.found ? `${plural(outcome.found, 'piece')} found. Check them, then save.` : 'Still nothing wearable found in that photo.');
+    }
+  };
+
+  /**
    * Tags photos one at a time. Free API tiers rate-limit aggressively, and a
    * burst of parallel vision calls is the fastest way to trip that, so this
    * trades wall-clock for reliability and shows progress instead.
@@ -1274,37 +1351,16 @@ function UploadView({ tagPhoto, onSaveBatch, onCancel, onToast }) {
     let detected = 0;
 
     for (let index = 0; index < queue.length; index += 1) {
-      const entry = queue[index];
-      patchEntry(entry.id, { status: 'tagging', error: '' });
-
-      try {
-        if (!tagPhoto) throw new Error('Add an API key in Settings to auto-tag.');
-        const response = await tagPhoto(entry.file);
-        const found = (Array.isArray(response) ? response : response?.items) || [];
-        const items = found.map((item) => normalizeItem({ ...item, id: uid(), sourcePhotoId: 'pending' }));
-        detected += items.length;
-        patchEntry(entry.id, {
-          status: 'done',
-          model: response?.model || '',
-          items: items.length ? items : [blankItem()],
-          note: items.length ? '' : 'Nothing wearable was found here. Add it by hand or remove the photo.',
-        });
-      } catch (error) {
-        failures += 1;
-        patchEntry(entry.id, {
-          status: 'failed',
-          error: error?.message || 'Tagging failed for this photo.',
-          items: [blankItem()],
-        });
-      }
-
+      const outcome = await tagEntry(queue[index]);
+      if (outcome.failed) failures += 1;
+      detected += outcome.found;
       setProgress({ done: index + 1, total: queue.length });
     }
 
     setStage('review');
     setTaggingNote(
       failures
-        ? `${detected} ${detected === 1 ? 'piece' : 'pieces'} found. ${failures} ${failures === 1 ? 'photo' : 'photos'} could not be tagged — fill those in by hand below, or remove them.`
+        ? `${detected} ${detected === 1 ? 'piece' : 'pieces'} found. ${failures} ${failures === 1 ? 'photo' : 'photos'} could not be tagged. Tap Try again below.`
         : `${detected} ${detected === 1 ? 'piece' : 'pieces'} found across ${queue.length} ${queue.length === 1 ? 'photo' : 'photos'}. Review before saving.`,
     );
   };
@@ -1379,11 +1435,12 @@ function UploadView({ tagPhoto, onSaveBatch, onCancel, onToast }) {
     setMergeSelection([]);
   };
 
-  const totalItems = entries.reduce((count, entry) => count + entry.items.length, 0);
+  // A photo that failed (or is being retried) has only a blank placeholder, which must never be saved.
+  const savable = entries.filter((entry) => entry.status !== 'failed' && entry.status !== 'tagging' && entry.items.length);
+  const totalItems = savable.reduce((count, entry) => count + entry.items.length, 0);
 
   const save = async () => {
-    const groups = entries
-      .filter((entry) => entry.items.length)
+    const groups = savable
       .map((entry) => ({ file: entry.file, sourcePhotoId: uid(), reviewedItems: entry.items }));
     if (!groups.length) return;
 
@@ -1451,7 +1508,7 @@ function UploadView({ tagPhoto, onSaveBatch, onCancel, onToast }) {
           <>
             <div className="batch-progress" role="status" aria-live="polite">
               <div className="batch-progress-bar"><span style={{ width: `${progress.total ? (progress.done / progress.total) * 100 : 0}%` }} /></div>
-              <p>Tagging photo {Math.min(progress.done + 1, progress.total)} of {progress.total}…</p>
+              <p>{busyNote || `Tagging photo ${Math.min(progress.done + 1, progress.total)} of ${progress.total}…`}</p>
             </div>
             <p className="inline-note">One at a time, so a free API tier doesn’t rate-limit the batch.</p>
           </>
@@ -1495,28 +1552,42 @@ function UploadView({ tagPhoto, onSaveBatch, onCancel, onToast }) {
             <img src={entry.previewUrl} alt="" />
             <span>
               <strong>Photo {entryIndex + 1}</strong>
-              <small>{entry.items.length} {entry.items.length === 1 ? 'piece' : 'pieces'} · all link back to this photo</small>
+              <small>{entry.status === 'failed' || entry.status === 'tagging' ? 'Not tagged yet' : `${plural(entry.items.length, 'piece')} found`}</small>
             </span>
             <button className="icon-text-button danger-text" type="button" onClick={() => removeEntry(entry.id)}>Remove</button>
           </div>
-          {entry.error && <p className="key-warning" role="alert">{entry.error}</p>}
-          {entry.note && <p className="inline-note">{entry.note}</p>}
-
-          <div className="review-list">
-            {entry.items.map((item, index) => (
-              <ReviewItemCard
-                key={item.id}
-                item={item}
-                index={index}
-                preview={entry.previewUrl}
-                selected={mergeSelection.includes(`${entry.id}:${item.id}`)}
-                onToggleMerge={() => toggleMerge(entry.id, item.id)}
-                onChange={(changes) => patchItem(entry.id, item.id, changes)}
-                onRemove={() => removeItem(entry.id, item.id)}
-              />
-            ))}
-          </div>
-          <button className="secondary-button compact" type="button" onClick={() => addItem(entry.id)}><Plus className="inline-icon" aria-hidden="true" /> Split / add a piece</button>
+          {(entry.status === 'failed' || entry.status === 'tagging') ? (
+            <div className="retry-box" role={entry.status === 'failed' ? 'alert' : 'status'}>
+              <p>{entry.status === 'tagging' ? (busyNote || 'Tagging this photo again…') : entry.error}</p>
+              <div className="retry-actions">
+                <button className="primary-button compact" type="button" disabled={entry.status === 'tagging'} onClick={() => retryEntry(entry)}>
+                  {entry.status === 'tagging' ? <><span className="button-spinner" /> Trying…</> : <><RefreshCw className="inline-icon" aria-hidden="true" /> Try again</>}
+                </button>
+                {entry.status === 'failed' && (
+                  <button className="text-button" type="button" onClick={() => patchEntry(entry.id, { status: 'manual', error: '' })}>Fill in by hand</button>
+                )}
+              </div>
+            </div>
+          ) : (
+            <>
+              {entry.note && <p className="inline-note">{entry.note}</p>}
+              <div className="review-list">
+                {entry.items.map((item, index) => (
+                  <ReviewItemCard
+                    key={item.id}
+                    item={item}
+                    index={index}
+                    preview={entry.previewUrl}
+                    selected={mergeSelection.includes(`${entry.id}:${item.id}`)}
+                    onToggleMerge={() => toggleMerge(entry.id, item.id)}
+                    onChange={(changes) => patchItem(entry.id, item.id, changes)}
+                    onRemove={() => removeItem(entry.id, item.id)}
+                  />
+                ))}
+              </div>
+              <button className="text-button" type="button" onClick={() => addItem(entry.id)}><Plus className="inline-icon" aria-hidden="true" /> Add a piece the AI missed</button>
+            </>
+          )}
         </div>
       ))}
 
@@ -1530,6 +1601,27 @@ function UploadView({ tagPhoto, onSaveBatch, onCancel, onToast }) {
 
 function ReviewItemCard({ item, index, preview, selected, onToggleMerge, onChange, onRemove }) {
   const updateList = (key, value) => onChange({ [key]: asList(value) });
+  // Compact by default: the AI's tags are usually right, so the whole form is
+  // one tap away rather than in the way. A piece with nothing filled in (added
+  // by hand) opens straight to the form.
+  const [isOpen, setIsOpen] = useState(() => !item.colors.length && !item.notes);
+
+  if (!isOpen) {
+    const details = [...item.styleTags.slice(0, 2), ...item.seasons.slice(0, 2)].join(' · ');
+    return (
+      <article className="review-row">
+        <CroppedImage src={preview} crop={item.crop} alt="" className="review-row-photo" />
+        <div className="review-row-copy">
+          <strong>{displayCategory(item.category)}{item.colors.length ? ` · ${item.colors.join(', ')}` : ''}</strong>
+          {item.notes && <span>{item.notes}</span>}
+          {details && <small>{details}</small>}
+        </div>
+        <button className="text-button" type="button" onClick={() => setIsOpen(true)}>Edit</button>
+        <button className="icon-text-button" type="button" onClick={onRemove} aria-label={`Remove piece ${index + 1}`}><X aria-hidden="true" /></button>
+      </article>
+    );
+  }
+
   return (
     <article className="review-card">
       <div className="review-card-topline">
@@ -1556,6 +1648,7 @@ function ReviewItemCard({ item, index, preview, selected, onToggleMerge, onChang
         <label className="span-two">Season / weather<input value={item.seasons.join(', ')} placeholder="e.g. mild, summer" onChange={(event) => updateList('seasons', event.target.value)} /><small className="field-hint">{SEASON_HINT}</small></label>
         <label className="span-two">Notes<input value={item.notes} placeholder="What is this piece?" onChange={(event) => onChange({ notes: event.target.value })} /></label>
       </div>
+      <button className="secondary-button full-width review-done" type="button" onClick={() => setIsOpen(false)}>Done</button>
     </article>
   );
 }
@@ -2463,27 +2556,55 @@ function OutfitPhotoModal({ items, blobUrls, analyze, weatherLocation, onClose, 
     if (!picked) return;
     setFile(picked);
     setResult(null);
+    setReadError('');
     setIsLogged(false);
   };
 
+  const [readError, setReadError] = useState('');
+  const [waitingNote, setWaitingNote] = useState('');
+  // Which "Change" row is open; corrections are there if needed, out of the way if not.
+  const [changingIndex, setChangingIndex] = useState(-1);
+
   const read = async () => {
     setIsReading(true);
+    setReadError('');
     try {
-      const analysis = await analyze(file, { items, occasion, forecastNote: forecastNote(today, weatherLocation?.shortName) });
+      const analysis = await retryWhenBusy(
+        () => analyze(file, { items, occasion, forecastNote: forecastNote(today, weatherLocation?.shortName) }),
+        () => setWaitingNote('Google is busy. Trying again in a few seconds…'),
+      );
       setResult(analysis);
-      setMatches(analysis.wearing.map((entry) => entry.itemId));
+      // Each piece is a saved one, or new (added when logging), or skipped.
+      // When the AI didn't recognise a piece, a saved one of the same category
+      // sharing a colour is taken as it, so logging doesn't add a duplicate.
+      // "Change" fixes a wrong guess either way.
+      const taken = new Set(analysis.wearing.map((entry) => entry.itemId).filter(Boolean));
+      const colourWords = (colors = []) => colors.map((color) => String(color).toLowerCase());
+      const likelyMine = (entry) => {
+        const wanted = colourWords(entry.piece?.colors);
+        if (!wanted.length) return '';
+        const match = items.find((item) => item.category === entry.category && !taken.has(item.id)
+          && colourWords(item.colors).some((color) => wanted.some((word) => color.includes(word) || word.includes(color))));
+        if (match) taken.add(match.id);
+        return match?.id || '';
+      };
+      setMatches(analysis.wearing.map((entry) => entry.itemId || likelyMine(entry) || (entry.piece ? 'new' : 'skip')));
+      setChangingIndex(-1);
     } catch (error) {
-      onToast(error?.message || 'That photo could not be read. Try again.');
+      setReadError(error?.message || 'That photo could not be read.');
     } finally {
       setIsReading(false);
+      setWaitingNote('');
     }
   };
 
-  const matchedIds = [...new Set(matches.filter(Boolean))];
+  const savedIds = [...new Set(matches.filter((value) => value && value !== 'new' && value !== 'skip'))];
+  const newPieces = result ? result.wearing.filter((entry, index) => matches[index] === 'new' && entry.piece).map((entry) => entry.piece) : [];
+  const total = savedIds.length + newPieces.length;
 
   const log = async () => {
     try {
-      await onLog(matchedIds, result?.verdict || '', () => setIsLogged(false));
+      await onLog({ itemIds: savedIds, newPieces, file, verdict: result?.verdict || '', onUndone: () => setIsLogged(false) });
       setIsLogged(true);
     } catch (error) {
       onToast(error?.message || 'That outfit could not be logged.');
@@ -2491,6 +2612,10 @@ function OutfitPhotoModal({ items, blobUrls, analyze, weatherLocation, onClose, 
   };
 
   const describe = (item) => `${displayCategory(item.category)} · ${item.colors.join(', ') || 'untitled'}`;
+  const setMatch = (index, value) => {
+    setMatches((current) => current.map((entry, other) => (other === index ? value : entry)));
+    setChangingIndex(-1);
+  };
 
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
@@ -2516,10 +2641,20 @@ function OutfitPhotoModal({ items, blobUrls, analyze, weatherLocation, onClose, 
 
         {file && !result && (
           <>
-            <label className="wanted-select">Dressed for<select value={occasion} onChange={(event) => setOccasion(event.target.value)}>{OCCASIONS.map((option) => <option key={option}>{option}</option>)}</select></label>
-            <button className="primary-button full-width" type="button" disabled={!hasAi || isReading} onClick={read}>
-              {isReading ? <><span className="button-spinner" /> Looking…</> : <>Read my outfit <span className="button-icon" aria-hidden="true"><Sparkles /></span></>}
-            </button>
+            {readError && (
+              <div className="retry-box" role="alert">
+                <p>{readError}</p>
+                <button className="secondary-button compact" type="button" disabled={isReading} onClick={read}>
+                  {isReading ? <><span className="button-spinner dark" /> {waitingNote || 'Trying…'}</> : <><RefreshCw className="inline-icon" aria-hidden="true" /> Try again</>}
+                </button>
+              </div>
+            )}
+            {!readError && <label className="wanted-select">Dressed for<select value={occasion} onChange={(event) => setOccasion(event.target.value)}>{OCCASIONS.map((option) => <option key={option}>{option}</option>)}</select></label>}
+            {!readError && (
+              <button className="primary-button full-width" type="button" disabled={!hasAi || isReading} onClick={read}>
+                {isReading ? <><span className="button-spinner" /> {waitingNote || 'Looking…'}</> : <>Read my outfit <span className="button-icon" aria-hidden="true"><Sparkles /></span></>}
+              </button>
+            )}
             <button className="text-button" type="button" onClick={() => inputRef.current?.click()}>Use a different photo</button>
           </>
         )}
@@ -2527,56 +2662,75 @@ function OutfitPhotoModal({ items, blobUrls, analyze, weatherLocation, onClose, 
         {result && (
           <>
             <div className="explanation-card"><span aria-hidden="true"><Sparkles /></span><p>{result.verdict || 'Here\'s what I see.'}</p></div>
-            {result.working.length > 0 && (
-              <section className="feedback-section">
-                <h3>Working</h3>
-                <ul>{result.working.map((line) => <li key={line}>{line}</li>)}</ul>
-              </section>
-            )}
-            {result.tweaks.length > 0 && (
-              <section className="feedback-section">
-                <h3>Worth trying</h3>
-                <ul>
-                  {result.tweaks.map((tweak) => {
-                    const swap = tweak.swapItemId ? itemsById.get(tweak.swapItemId) : null;
-                    return (
-                      <li key={tweak.suggestion} className={swap ? 'has-swap' : ''}>
-                        <span>{tweak.suggestion}</span>
-                        {swap && <span className="swap-chip"><Photo item={swap} blobUrls={blobUrls} className="swap-photo" alt="" />{describe(swap)}</span>}
-                      </li>
-                    );
-                  })}
-                </ul>
-              </section>
-            )}
 
-            <section className="feedback-section">
-              <h3>What you're wearing</h3>
-              {result.wearing.length ? (
-                <ul className="match-list">
-                  {result.wearing.map((entry, index) => {
-                    const chosen = matches[index] ? itemsById.get(matches[index]) : null;
-                    const options = items.filter((item) => item.category === entry.category || item.id === matches[index]);
-                    return (
-                      <li key={`${entry.description}-${index}`}>
-                        {chosen ? <Photo item={chosen} blobUrls={blobUrls} className="match-photo" alt="" /> : <span className="match-photo photo-placeholder"><span>?</span></span>}
-                        <label>
-                          <small>{entry.description || displayCategory(entry.category)}</small>
-                          <select value={matches[index] || ''} disabled={isLogged} onChange={(event) => setMatches((current) => current.map((value, other) => (other === index ? event.target.value : value)))}>
-                            <option value="">Not in my wardrobe</option>
-                            {options.map((item) => <option key={item.id} value={item.id}>{describe(item)}</option>)}
+            {result.wearing.length ? (
+              <ul className="wearing-list">
+                {result.wearing.map((entry, index) => {
+                  const value = matches[index];
+                  const saved = value && value !== 'new' && value !== 'skip' ? itemsById.get(value) : null;
+                  const options = items.filter((item) => item.category === entry.category || item.id === value);
+                  return (
+                    <li key={`${entry.description}-${index}`} className={value === 'skip' ? 'is-skipped' : ''}>
+                      {saved
+                        ? <Photo item={saved} blobUrls={blobUrls} className="wearing-photo" alt="" />
+                        : <CroppedImage src={previewUrl} crop={entry.piece?.crop} className="wearing-photo" />}
+                      <div className="wearing-copy">
+                        <strong>{entry.description || displayCategory(entry.category)}</strong>
+                        <span className={`wearing-badge ${saved ? 'is-saved' : value === 'new' ? 'is-new' : ''}`}>
+                          {saved ? 'In your wardrobe' : value === 'new' ? 'New — will be added' : 'Not logged'}
+                        </span>
+                        {changingIndex === index && !isLogged && (
+                          <select value={value} onChange={(event) => setMatch(index, event.target.value)} aria-label={`What ${entry.description || 'this piece'} is`}>
+                            {entry.piece && <option value="new">Add as a new piece</option>}
+                            {options.map((item) => <option key={item.id} value={item.id}>Mine: {describe(item)}</option>)}
+                            <option value="skip">Don’t log this one</option>
                           </select>
-                        </label>
-                      </li>
-                    );
-                  })}
-                </ul>
-              ) : <p className="field-hint">No clothes were picked out of this photo.</p>}
-            </section>
+                        )}
+                      </div>
+                      {!isLogged && changingIndex !== index && (
+                        <button className="text-button" type="button" onClick={() => setChangingIndex(index)}>Change</button>
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
+            ) : <p className="field-hint">No clothes were picked out of this photo.</p>}
 
-            <button className={`primary-button full-width ${isLogged ? 'success-button' : ''}`} type="button" disabled={isLogged || !matchedIds.length} onClick={log}>
-              {isLogged ? '✓ Logged for today' : matchedIds.length ? `Log ${plural(matchedIds.length, 'piece')} as worn today` : 'Nothing matched to log'}
+            <button className={`primary-button full-width ${isLogged ? 'success-button' : ''}`} type="button" disabled={isLogged || !total} onClick={log}>
+              {isLogged
+                ? '✓ Logged for today'
+                : newPieces.length
+                  ? `Log today’s outfit · add ${plural(newPieces.length, 'new piece')}`
+                  : 'Log today’s outfit'}
             </button>
+
+            {(result.working.length > 0 || result.tweaks.length > 0) && (
+              <details className="feedback-details">
+                <summary>What works, and what to try</summary>
+                {result.working.length > 0 && (
+                  <section className="feedback-section">
+                    <h3>Working</h3>
+                    <ul>{result.working.map((line) => <li key={line}>{line}</li>)}</ul>
+                  </section>
+                )}
+                {result.tweaks.length > 0 && (
+                  <section className="feedback-section">
+                    <h3>Worth trying</h3>
+                    <ul>
+                      {result.tweaks.map((tweak) => {
+                        const swap = tweak.swapItemId ? itemsById.get(tweak.swapItemId) : null;
+                        return (
+                          <li key={tweak.suggestion} className={swap ? 'has-swap' : ''}>
+                            <span>{tweak.suggestion}</span>
+                            {swap && <span className="swap-chip"><Photo item={swap} blobUrls={blobUrls} className="swap-photo" alt="" />{describe(swap)}</span>}
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  </section>
+                )}
+              </details>
+            )}
             {!isLogged && <button className="text-button" type="button" onClick={() => inputRef.current?.click()}>Try another photo</button>}
           </>
         )}

@@ -758,3 +758,54 @@ describe('Gemini reasoning effort', () => {
     }
   });
 });
+
+describe('photo check: pieces that are not in the wardrobe yet', () => {
+  it('describes and locates each worn piece, so an unknown one can be added straight away', async () => {
+    const calls = stubFetch(asJson({
+      wearing: [
+        { category: 'top', description: 'grey zip hoodie', itemId: '', colors: ['grey'], styleTags: ['casual'], seasons: ['autumn'], weather: ['cool'], box: [200, 250, 600, 750] },
+        { category: 'bottom', description: 'light jeans', itemId: '', colors: [], styleTags: [], seasons: [], weather: [], box: [] },
+      ],
+      verdict: 'Easy.',
+      working: [],
+      tweaks: [],
+    }));
+    const result = await analyzeOutfitPhoto(PHOTO, { provider: makeProvider(), wardrobe: [] });
+
+    expect(calls[0].body.response_format.json_schema.schema.properties.wearing.items.required).toEqual(expect.arrayContaining(['colors', 'box']));
+    const [hoodie, jeans] = result.wearing;
+    expect(hoodie.itemId).toBe('');
+    expect(hoodie.piece).toMatchObject({ category: 'top', colors: ['grey'], notes: 'grey zip hoodie' });
+    expect(hoodie.piece.seasons).toEqual(expect.arrayContaining(['autumn', 'cool']));
+    expect(hoodie.piece.crop).toMatchObject({ unit: 'percent' });
+    // No box: still addable, just shown with the whole photo.
+    expect(jeans.piece).toMatchObject({ category: 'bottom', crop: null });
+  });
+});
+
+describe('free daily allowance used up', () => {
+  const QUOTA = 'You exceeded your current quota, please check your plan and billing details.\n* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 20, model: gemini-3.6-flash\nPlease retry in 12h26.580473394s.';
+  const builtin = () => makeProvider({ presetId: 'builtin', label: 'Built-in AI (Gemini)', baseUrl: '/api/gemini', apiKey: 'passcode', model: 'gemini-3.6-flash', fallbackModel: 'gemini-3.8-flash' });
+
+  it('says the daily allowance is used up and when it resets, not that the account is out of credit', async () => {
+    stubFetch(failWith(429, QUOTA));
+    const error = await outfitCall(builtin()).catch((caught) => caught);
+    expect(error.message).toContain('used up today\'s free allowance; it resets in about 12 hours');
+    expect(error.message).not.toContain('out of credit');
+    expect(error.dailyQuota).toBe(true);
+  });
+
+  it('when the backup model is busy too, says both, and leaves it retryable', async () => {
+    stubFetch(failWith(429, QUOTA), failWith(503, 'This model is currently experiencing high demand.'));
+    const error = await outfitCall(builtin()).catch((caught) => caught);
+    expect(error.message).toContain('used up today\'s free allowance');
+    expect(error.message).toContain('backup model is busy');
+    expect(error.status).toBe(503);
+    expect(error.dailyQuota).toBeFalsy();
+  });
+
+  it('still treats a per-minute rate limit as a short wait', async () => {
+    stubFetch(failWith(429, 'Rate limit reached for requests per minute.'));
+    await expect(outfitCall(makeProvider({ fallbackModel: '' }))).rejects.toThrow('Wait a minute and try again');
+  });
+});
