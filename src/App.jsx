@@ -8,12 +8,27 @@ import {
   spotlightStyle,
 } from './lib/crop.js';
 import {
+  EMPTY_FEEDBACK,
   computeWardrobeStats,
+  deriveFeedback,
   filterWardrobeForOutfit,
+  isAvailable,
+  isCompleteOutfit,
+  localOutfit,
   missingForCompleteOutfit,
   occasionKey,
+  packForTrip,
+  planOutfitsForDays,
   shuffleOutfit,
 } from './lib/outfit.js';
+import {
+  MAX_FORECAST_DAYS,
+  currentRoundedPosition,
+  describeDay,
+  fetchForecast,
+  forecastNote,
+  searchPlaces,
+} from './lib/weather.js';
 import { BUILTIN_PRESET_ID, DEFAULT_PRESET_ID, PROVIDER_PRESETS, detectKeyMismatch, getPreset } from './lib/providers.js';
 import { testProvider } from './lib/ai.js';
 import {
@@ -30,9 +45,11 @@ import {
   getActiveProviderId,
   getProviders,
   getRepeatDays,
+  getWeatherLocation,
   hasAnyProvider,
   setActiveProviderId,
   setRepeatDays,
+  setWeatherLocation,
   updateProvider,
 } from './lib/settings.js';
 import './App.css';
@@ -50,6 +67,7 @@ const CATEGORY_META = {
 const OCCASIONS = ['Everyday', 'Work', 'Dinner', 'Date night', 'Event', 'Active'];
 const VIBES = ['Easy', 'Polished', 'Playful', 'Minimal', 'Sporty', 'Bold'];
 const WEATHER_OPTIONS = [
+  { value: 'cold', label: 'Cold', temperature: 6 },
   { value: 'cool', label: 'Cool', temperature: 14 },
   { value: 'mild', label: 'Mild', temperature: 20 },
   { value: 'warm', label: 'Warm', temperature: 26 },
@@ -61,6 +79,15 @@ const WEATHER_OPTIONS = [
 // Shared by the item editor's hint text and bulk-edit's "set season" action.
 const SEASON_WEATHER_VALUES = ['spring', 'summer', 'autumn', 'winter', 'all-season', 'cold', 'cool', 'mild', 'warm', 'hot', 'rainy', 'windy'];
 const SEASON_HINT = `Recognised: ${SEASON_WEATHER_VALUES.join(', ')}`;
+
+// Why a piece is out of rotation. Suggestions, shuffles and plans skip it.
+const UNAVAILABLE_OPTIONS = [
+  { value: 'laundry', label: 'In the wash', short: 'In the wash' },
+  { value: 'cleaning', label: 'At the dry cleaner', short: 'Dry cleaning' },
+  { value: 'repair', label: 'Needs repair', short: 'Needs repair' },
+  { value: 'away', label: 'Lent out or packed away', short: 'Away' },
+];
+const unavailableLabel = (reason) => UNAVAILABLE_OPTIONS.find((option) => option.value === reason)?.short || '';
 
 // Each photo costs one vision call and one decode, so a batch is bounded to keep
 // tagging time and peak memory predictable on a phone.
@@ -89,6 +116,7 @@ function normalizeItem(item = {}) {
     notes: item.notes || '',
     lastWornDate: item.lastWornDate || item.last_worn_date || '',
     pricePaid: Number(item.pricePaid) > 0 ? Number(item.pricePaid) : null,
+    unavailable: UNAVAILABLE_OPTIONS.some((option) => option.value === item.unavailable) ? item.unavailable : '',
     crop: item.crop || null,
   };
 }
@@ -104,7 +132,7 @@ function normalizeOutfitEntry(record = {}) {
     id: record.id || uid(),
     date: record.date || localDate(),
     itemIds: Array.isArray(record.itemIds) ? record.itemIds.filter(Boolean) : [],
-    status: record.status === 'planned' ? 'planned' : 'worn',
+    status: ['planned', 'loved', 'rejected'].includes(record.status) ? record.status : 'worn',
     source: record.source || 'manual',
     explanation: record.explanation || '',
     occasion: record.occasion || '',
@@ -132,6 +160,54 @@ function formatDate(value) {
   return new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' }).format(date);
 }
 
+function addDays(dateString, count) {
+  const date = new Date(`${dateString}T12:00:00`);
+  date.setDate(date.getDate() + count);
+  const offset = date.getTimezoneOffset() * 60_000;
+  return new Date(date.getTime() - offset).toISOString().slice(0, 10);
+}
+
+function weekday(dateString) {
+  return new Intl.DateTimeFormat(undefined, { weekday: 'short' }).format(new Date(`${dateString}T12:00:00`));
+}
+
+const isWeekend = (dateString) => [0, 6].includes(new Date(`${dateString}T12:00:00`).getDay());
+
+// One forecast per place, reused across the Outfit and Journal screens for
+// half an hour, so switching tabs doesn't re-ask the weather service.
+const forecastCache = new Map();
+const FORECAST_TTL_MS = 30 * 60_000;
+
+async function loadForecast(location) {
+  const key = `${location.latitude},${location.longitude}`;
+  const cached = forecastCache.get(key);
+  if (cached && Date.now() - cached.at < FORECAST_TTL_MS) return cached.days;
+  const days = await fetchForecast(location, { days: MAX_FORECAST_DAYS });
+  forecastCache.set(key, { at: Date.now(), days });
+  return days;
+}
+
+/** The forecast for a saved location: { days, error }, or nothing while off. */
+function useForecast(location) {
+  const [state, setState] = useState({ days: null, error: '' });
+  const latitude = location?.latitude;
+  const longitude = location?.longitude;
+
+  useEffect(() => {
+    if (latitude === undefined || longitude === undefined) {
+      setState({ days: null, error: '' });
+      return undefined;
+    }
+    let isCurrent = true;
+    loadForecast({ latitude, longitude })
+      .then((days) => { if (isCurrent) setState({ days, error: '' }); })
+      .catch((error) => { if (isCurrent) setState({ days: null, error: error.message }); });
+    return () => { isCurrent = false; };
+  }, [latitude, longitude]);
+
+  return state;
+}
+
 function itemImage(item, blobUrls) {
   return item.imageUrl || blobUrls[item.id] || '';
 }
@@ -140,36 +216,23 @@ function itemImage(item, blobUrls) {
  * Narrows the wardrobe before anything is sent for styling: season and weather
  * first, then occasion and vibe overlap, with recently worn pieces pushed down.
  */
-function shortlistForSuggestion(items, preferences, repeatDays, excludedItemIds) {
+function suggestionFilters(preferences, feedback) {
+  return {
+    weather: preferences.weather,
+    rain: Boolean(preferences.rain),
+    occasion: occasionKey(preferences.occasion),
+    vibe: preferences.vibe,
+    requiredItemId: preferences.wantedItemId,
+    feedback,
+  };
+}
+
+function shortlistForSuggestion(items, preferences, repeatDays, excludedItemIds, feedback) {
   const wanted = preferences.wantedItemId;
-  const shortlist = filterWardrobeForOutfit(
-    items,
-    {
-      weather: preferences.weather,
-      occasion: occasionKey(preferences.occasion),
-      vibe: preferences.vibe,
-      requiredItemId: wanted,
-    },
-    repeatDays,
-  );
+  const shortlist = filterWardrobeForOutfit(items, suggestionFilters(preferences, feedback), repeatDays);
 
   // A re-roll skips the previous suggestion, but never a piece the user asked for.
   return shortlist.filter((item) => item.id === wanted || !excludedItemIds.includes(item.id));
-}
-
-function makeLocalSuggestion(items) {
-  const pick = (category) => items.find((item) => item.category === category);
-  const dress = pick('dress');
-  const selected = dress
-    ? [dress, pick('shoes'), pick('outerwear'), pick('accessory')]
-    : [pick('top'), pick('bottom'), pick('shoes'), pick('outerwear'), pick('accessory')];
-  const outfit = selected.filter(Boolean);
-  return {
-    itemIds: outfit.map((item) => item.id),
-    explanation: outfit.length
-      ? 'Here is a balanced starting point from the pieces that match your answers. Add your API key in Settings for a tailored AI explanation.'
-      : 'Add a few more pieces so I can build a complete outfit.',
-  };
 }
 
 /**
@@ -312,6 +375,16 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
   const [buildingItemIds, setBuildingItemIds] = useState(null);
   // Bumped after a restore so the wardrobe and journal re-read storage
   const [restoredAt, setRestoredAt] = useState(0);
+  const [weatherLocation, setWeatherLocationState] = useState(getWeatherLocation);
+  // The "today's outfit photo" sheet, opened from Outfit or Journal.
+  const [photoCheckOpen, setPhotoCheckOpen] = useState(false);
+  // "Love it" / "never again" records, turned into what suggestions use.
+  const feedback = useMemo(() => deriveFeedback(outfitRecords, items), [outfitRecords, items]);
+
+  const changeWeatherLocation = (location) => {
+    setWeatherLocation(location);
+    setWeatherLocationState(getWeatherLocation());
+  };
 
   /**
    * Switches tabs and always drops any in-progress wardrobe selection, so a
@@ -495,6 +568,44 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
     }
   };
 
+  /** "Love it" or "never suggest this again" on a suggestion. */
+  const rateOutfit = async ({ itemIds, rating, source, explanation }) => {
+    const record = await services.rateOutfit?.({ itemIds, rating, source, explanation });
+    if (record) setOutfitRecords((current) => [normalizeOutfitEntry(record), ...current]);
+  };
+
+  /** Saves a week plan or trip as planned outfits, one record per day. */
+  const savePlan = async (days, { source, occasion = '' }) => {
+    try {
+      const saved = [];
+      for (const day of days) {
+        if (!day.itemIds.length) continue;
+        const record = await services.planOutfit?.({ itemIds: day.itemIds, date: day.date, occasion: day.occasion || occasion, source });
+        if (record) saved.push(normalizeOutfitEntry(record));
+      }
+      setOutfitRecords((current) => [...saved, ...current]);
+      setToast(`${plural(saved.length, 'outfit')} planned. They're in your journal.`);
+      return true;
+    } catch (error) {
+      setToast(error?.message || 'That plan could not be saved.');
+      return false;
+    }
+  };
+
+  /** Marks pieces out of rotation (or back in), from the wardrobe or the editor. */
+  const setAvailability = (ids, reason) => bulkUpdateWardrobe(ids, { unavailable: reason || '' });
+
+  // "Allow again" for a ruled-out pairing: just removes the record, no confirm,
+  // since it's as easy to rule out again.
+  const removeOutfitRecordQuietly = async (id) => {
+    try {
+      await services.deleteOutfitRecord?.(id);
+      setOutfitRecords((current) => current.filter((record) => record.id !== id));
+    } catch (error) {
+      setToast(error?.message || 'That could not be changed.');
+    }
+  };
+
   const deleteOutfitEntry = async (id) => {
     if (!window.confirm('Remove this outfit from your journal? This cannot be undone.')) return;
     try {
@@ -566,6 +677,7 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
             onBulkUpdate={bulkUpdateWardrobe}
             onBulkDelete={bulkDeleteWardrobe}
             onBuildOutfit={setBuildingItemIds}
+            onSetAvailability={setAvailability}
           />
         )}
         {activeTab === 'upload' && (
@@ -583,9 +695,13 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
             repeatDays={getRepeatDays()}
             onSuggest={services.suggestOutfit}
             onWearOutfit={wearOutfit}
+            onRateOutfit={rateOutfit}
             onAdd={() => goToTab('upload')}
             onBuildOwn={startBuildingOutfit}
+            onOpenPhotoCheck={() => setPhotoCheckOpen(true)}
             onToast={setToast}
+            feedback={feedback}
+            weatherLocation={weatherLocation}
           />
         )}
         {activeTab === 'journal' && (
@@ -595,11 +711,21 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
             outfitRecords={outfitRecords}
             onPlanOutfit={startBuildingOutfit}
             onDeleteOutfitRecord={deleteOutfitEntry}
+            onAllowAgain={removeOutfitRecordQuietly}
+            onOpenPhotoCheck={() => setPhotoCheckOpen(true)}
+            onSavePlan={savePlan}
+            buildCapsule={services.buildCapsule}
             onAdd={() => goToTab('upload')}
+            onToast={setToast}
+            feedback={feedback}
+            repeatDays={getRepeatDays()}
+            weatherLocation={weatherLocation}
           />
         )}
         {activeTab === 'settings' && (
           <SettingsView
+            weatherLocation={weatherLocation}
+            onWeatherLocationChange={changeWeatherLocation}
             onClear={clearWardrobe}
             exportBackup={services.exportBackup}
             onRestore={restoreWardrobe}
@@ -624,6 +750,20 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
           onClose={() => setEditingItem(null)}
           onSave={updateItem}
           onDelete={deleteItem}
+        />
+      )}
+      {photoCheckOpen && (
+        <OutfitPhotoModal
+          items={items}
+          blobUrls={blobUrls}
+          analyze={services.analyzeOutfitPhoto}
+          weatherLocation={weatherLocation}
+          onClose={() => setPhotoCheckOpen(false)}
+          onLog={async (itemIds, verdict) => {
+            await wearOutfit({ itemIds, date: localDate(), source: 'photo', explanation: verdict });
+            setToast('Logged as worn today.');
+          }}
+          onToast={setToast}
         />
       )}
       {buildingItemIds && (
@@ -653,16 +793,26 @@ function NavButton({ icon, label, active, onClick }) {
 
 function WardrobeView({
   items, blobUrls, onOpenItem, onAdd, onSuggest, isLoading,
-  mode, onSetMode, onBulkUpdate, onBulkDelete, onBuildOutfit,
+  mode, onSetMode, onBulkUpdate, onBulkDelete, onBuildOutfit, onSetAvailability,
 }) {
   const [filter, setFilter] = useState('all');
   const [selectedIds, setSelectedIds] = useState([]);
   const [bulkTag, setBulkTag] = useState('');
   const [bulkSeason, setBulkSeason] = useState(SEASON_WEATHER_VALUES[0]);
-  const filteredItems = useMemo(
-    () => (filter === 'all' ? items : items.filter((item) => item.category === filter)),
-    [filter, items],
-  );
+  const [bulkAvailability, setBulkAvailability] = useState('laundry');
+  const unavailableCount = items.filter((item) => !isAvailable(item)).length;
+  const filteredItems = useMemo(() => {
+    if (filter === 'all') return items;
+    if (filter === 'unavailable') return items.filter((item) => !isAvailable(item));
+    return items.filter((item) => item.category === filter);
+  }, [filter, items]);
+
+  // The filter is only offered while something is out; don't strand it.
+  useEffect(() => {
+    if (filter === 'unavailable' && !unavailableCount) setFilter('all');
+  }, [filter, unavailableCount]);
+
+  const selectAllShown = () => setSelectedIds(filteredItems.map((item) => item.id));
 
   const selecting = mode === 'edit' || mode === 'build';
 
@@ -733,7 +883,14 @@ function WardrobeView({
             onClick={() => setFilter(category)}
           />
         ))}
+        {unavailableCount > 0 && (
+          <FilterChip label="Out of rotation" active={filter === 'unavailable'} count={unavailableCount} onClick={() => setFilter('unavailable')} />
+        )}
       </div>
+
+      {mode === 'edit' && filteredItems.length > 0 && selectedIds.length < filteredItems.length && (
+        <button className="text-button select-all" type="button" onClick={selectAllShown}>Select all {filteredItems.length} shown</button>
+      )}
 
       {isLoading ? (
         <div className="wardrobe-grid" aria-hidden="true">
@@ -745,7 +902,7 @@ function WardrobeView({
             const isSelected = selectedIds.includes(item.id);
             return (
               <button
-                className={`wardrobe-card ${isSelected ? 'is-selected' : ''}`}
+                className={`wardrobe-card ${isSelected ? 'is-selected' : ''} ${isAvailable(item) ? '' : 'is-unavailable'}`}
                 type="button"
                 key={item.id}
                 onClick={() => (selecting ? toggleSelected(item.id) : onOpenItem(item))}
@@ -756,7 +913,9 @@ function WardrobeView({
                   <span className="card-category">{displayCategory(item.category)}</span>
                   <span className="card-colors">{item.colors.length ? item.colors.join(' · ') : 'Untitled piece'}</span>
                 </span>
-                {item.lastWornDate && <span className="worn-badge">Worn {formatDate(item.lastWornDate)}</span>}
+                {isAvailable(item)
+                  ? item.lastWornDate && <span className="worn-badge">Worn {formatDate(item.lastWornDate)}</span>
+                  : <span className="worn-badge unavailable-badge">{unavailableLabel(item.unavailable)}</span>}
               </button>
             );
           })}
@@ -784,6 +943,17 @@ function WardrobeView({
             </select>
             <button className="secondary-button compact" type="button" onClick={setSeasonForSelected}>Set season</button>
           </div>
+          <div className="bulk-action-row">
+            <select value={bulkAvailability} onChange={(event) => setBulkAvailability(event.target.value)} aria-label="Why these pieces are out of rotation">
+              {UNAVAILABLE_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+            </select>
+            <button className="secondary-button compact" type="button" onClick={() => onSetAvailability(selectedIds, bulkAvailability)}>Mark out</button>
+          </div>
+          {selectedIds.some((id) => items.find((item) => item.id === id && !isAvailable(item))) && (
+            <button className="secondary-button full-width" type="button" onClick={() => onSetAvailability(selectedIds, '')}>
+              Back in rotation
+            </button>
+          )}
           <button className="danger-button full-width" type="button" onClick={() => onBulkDelete(selectedIds)}>
             Delete {selectedIds.length} {selectedIds.length === 1 ? 'piece' : 'pieces'}
           </button>
@@ -1201,11 +1371,16 @@ function ReviewItemCard({ item, index, preview, selected, onToggleMerge, onChang
   );
 }
 
-function OutfitView({ items, blobUrls, repeatDays, onSuggest, onWearOutfit, onAdd, onBuildOwn, onToast }) {
+function OutfitView({
+  items, blobUrls, repeatDays, onSuggest, onWearOutfit, onRateOutfit, onAdd, onBuildOwn, onOpenPhotoCheck, onToast,
+  feedback = EMPTY_FEEDBACK, weatherLocation,
+}) {
   const [preferences, setPreferences] = useState({
     occasion: 'Everyday',
     weather: 'mild',
     temperature: 20,
+    rain: false,
+    forecastNote: '',
     vibe: 'Easy',
     wantedItemId: '',
   });
@@ -1213,24 +1388,54 @@ function OutfitView({ items, blobUrls, repeatDays, onSuggest, onWearOutfit, onAd
   const [usedItemIds, setUsedItemIds] = useState([]);
   const [isThinking, setIsThinking] = useState(false);
   const [isWorn, setIsWorn] = useState(false);
+  const [rating, setRating] = useState('');
+  const forecast = useForecast(weatherLocation);
+  const today = forecast.days?.find((day) => day.date === localDate()) || null;
+  // Live weather fills the weather answer once; after that a tap on a chip wins.
+  const [weatherTouched, setWeatherTouched] = useState(false);
+
+  useEffect(() => {
+    if (!today || weatherTouched) return;
+    setPreferences((current) => ({
+      ...current,
+      weather: today.weather,
+      temperature: today.temperature,
+      rain: today.rain,
+      forecastNote: forecastNote(today, weatherLocation?.shortName),
+    }));
+  }, [today, weatherTouched, weatherLocation?.shortName]);
+
+  const pickWeather = (option) => {
+    setWeatherTouched(true);
+    setPreferences((current) => ({ ...current, weather: option.value, temperature: option.temperature, rain: false, forecastNote: '' }));
+  };
 
   const suggestionItems = suggestion?.itemIds.map((id) => items.find((item) => item.id === id)).filter(Boolean) || [];
+  const availableItems = items.filter(isAvailable);
 
   const requestSuggestion = async ({ exclude = [] } = {}) => {
-    const candidates = shortlistForSuggestion(items, preferences, repeatDays, exclude);
+    const candidates = shortlistForSuggestion(items, preferences, repeatDays, exclude, feedback);
     if (!candidates.length) {
       onToast('There are no unused pieces left to try. Change your answers, or start over with "Suggest my outfit".');
       return;
     }
+    // The no-AI pick uses the whole wardrobe's ranking (minus what was already
+    // shown), with the same feedback rules as the shuffle.
+    const makeLocalSuggestion = () => localOutfit(
+      items.filter((item) => item.id === preferences.wantedItemId || !exclude.includes(item.id)),
+      suggestionFilters(preferences, feedback),
+      repeatDays,
+    );
     setIsThinking(true);
     setIsWorn(false);
+    setRating('');
     try {
       let normalized;
       try {
         const usingAi = Boolean(onSuggest && hasAnyProvider());
         const response = usingAi
-          ? await onSuggest({ items: candidates, preferences, excludedItemIds: exclude, avoidRecentDays: repeatDays })
-          : makeLocalSuggestion(candidates);
+          ? await onSuggest({ items: candidates, preferences, excludedItemIds: exclude, avoidRecentDays: repeatDays, feedback })
+          : makeLocalSuggestion();
         normalized = {
           itemIds: (response?.itemIds || response?.items || []).map((entry) => typeof entry === 'string' ? entry : entry.id),
           explanation: response?.explanation || 'This combination is ready to wear.',
@@ -1242,7 +1447,7 @@ function OutfitView({ items, blobUrls, repeatDays, onSuggest, onWearOutfit, onAd
         // A failed AI call should not leave the screen empty — fall back to a
         // simple local pick so there is always something to look at, and say
         // plainly that this one skipped the AI step.
-        const local = makeLocalSuggestion(candidates);
+        const local = makeLocalSuggestion();
         if (!local.itemIds.length) throw error;
         onToast(error?.message || 'The AI suggestion failed, so here is a basic pick instead.');
         normalized = { ...local, isFallback: true, source: 'local' };
@@ -1262,19 +1467,30 @@ function OutfitView({ items, blobUrls, repeatDays, onSuggest, onWearOutfit, onAd
    * AI suggestion also respects (weather/style ranking, not worn recently).
    */
   const requestShuffle = ({ exclude = [] } = {}) => {
-    const pool = items.filter((item) => !exclude.includes(item.id) || item.id === preferences.wantedItemId);
-    const result = shuffleOutfit(pool, {
-      weather: preferences.weather,
-      occasion: occasionKey(preferences.occasion),
-      vibe: preferences.vibe,
-      requiredItemId: preferences.wantedItemId,
-    }, repeatDays);
+    const filters = suggestionFilters(preferences, feedback);
+    const shuffleWithout = (ids) => shuffleOutfit(
+      items.filter((item) => !ids.includes(item.id) || item.id === preferences.wantedItemId),
+      filters,
+      repeatDays,
+    );
+    const itemsById = new Map(items.map((item) => [item.id, item]));
+    const isComplete = (ids) => isCompleteOutfit(ids, itemsById);
+
+    let result = shuffleWithout(exclude);
+    // "Shuffle again" avoids everything already shown, so a small wardrobe soon
+    // runs out of bottoms and starts showing a top on its own. When that
+    // happens, start a new round that only avoids what's on screen right now.
+    if (exclude.length && !isComplete(result.itemIds)) {
+      exclude = suggestion?.itemIds || [];
+      result = shuffleWithout(exclude);
+    }
 
     if (!result.itemIds.length) {
       onToast('Add a few more pieces so there is something to shuffle.');
       return;
     }
     setIsWorn(false);
+    setRating('');
     setSuggestion({ ...result, isFallback: false, source: 'shuffle' });
     setUsedItemIds(exclude);
   };
@@ -1301,6 +1517,27 @@ function OutfitView({ items, blobUrls, repeatDays, onSuggest, onWearOutfit, onAd
     }
   };
 
+  const rate = async (value) => {
+    if (!suggestionItems.length || rating) return;
+    try {
+      await onRateOutfit({
+        itemIds: suggestionItems.map((item) => item.id),
+        rating: value,
+        source: suggestion.source,
+        explanation: suggestion.explanation,
+      });
+      setRating(value);
+      if (value === 'loved') {
+        onToast('Loved. Pieces from it will come up a little more often.');
+      } else {
+        onToast('Got it. That pairing won\'t be suggested again. Undo it under Journal.');
+        reroll();
+      }
+    } catch (error) {
+      onToast(error?.message || 'That could not be saved.');
+    }
+  };
+
   // Block only on a genuinely empty wardrobe. A wardrobe missing one category
   // (no shoes yet, say) still deserves a suggestion — it just says so, rather
   // than refusing outright.
@@ -1324,7 +1561,7 @@ function OutfitView({ items, blobUrls, repeatDays, onSuggest, onWearOutfit, onAd
         <button className="text-button back-button" type="button" onClick={() => setSuggestion(null)}>← Change answers</button>
         <p className="eyebrow">YOUR OUTFIT</p>
         <h1>Here’s the move</h1>
-        <div className="answer-summary"><span>{preferences.occasion}</span><span>{preferences.vibe}</span><span>{preferences.temperature}°</span></div>
+        <div className="answer-summary"><span>{preferences.occasion}</span><span>{preferences.vibe}</span><span>{preferences.temperature}°{preferences.rain ? ' · rain' : ''}</span></div>
         <div className="outfit-row">
           {suggestionItems.map((item) => (
             <div className="outfit-piece" key={item.id}>
@@ -1341,6 +1578,14 @@ function OutfitView({ items, blobUrls, repeatDays, onSuggest, onWearOutfit, onAd
         <button className={`primary-button full-width ${isWorn ? 'success-button' : ''}`} type="button" onClick={wearThis} disabled={isWorn}>
           {isWorn ? '✓ Worn today' : 'Wear this'}
         </button>
+        <div className="rating-row">
+          <button className={`secondary-button ${rating === 'loved' ? 'is-loved' : ''}`} type="button" disabled={Boolean(rating) || isThinking} onClick={() => rate('loved')}>
+            {rating === 'loved' ? '♥ Loved' : '♡ Love it'}
+          </button>
+          <button className="secondary-button" type="button" disabled={Boolean(rating) || isThinking} onClick={() => rate('rejected')}>
+            Never suggest this
+          </button>
+        </div>
         <button className="secondary-button full-width" type="button" disabled={isThinking} onClick={reroll}>
           {isThinking ? <><span className="button-spinner dark" /> Finding another…</> : <>{suggestion.source === 'shuffle' ? 'Shuffle again' : 'Suggest another'} <span>↻</span></>}
         </button>
@@ -1366,9 +1611,14 @@ function OutfitView({ items, blobUrls, repeatDays, onSuggest, onWearOutfit, onAd
       </fieldset>
       <fieldset className="question-block">
         <legend>What’s the weather?</legend>
+        {today && !weatherTouched && (
+          <p className="forecast-line"><span aria-hidden="true">☁</span> {weatherLocation.shortName} today: {describeDay(today)}{today.rain ? ' — rain likely' : ''}</p>
+        )}
+        {weatherLocation && forecast.error && <p className="forecast-line">Live weather unavailable: {forecast.error}</p>}
         <div className="choice-grid weather-grid">
-          {WEATHER_OPTIONS.map((weather) => <ChoiceButton key={weather.value} active={preferences.weather === weather.value} onClick={() => setPreferences((current) => ({ ...current, weather: weather.value, temperature: weather.temperature }))}>{weather.label}<small>{weather.temperature}°</small></ChoiceButton>)}
+          {WEATHER_OPTIONS.map((weather) => <ChoiceButton key={weather.value} active={preferences.weather === weather.value} onClick={() => pickWeather(weather)}>{weather.label}<small>{preferences.weather === weather.value && !weatherTouched && today ? `${today.temperature}°` : `${weather.temperature}°`}</small></ChoiceButton>)}
         </div>
+        {!weatherLocation && <p className="field-hint">Tip: turn on live weather in Settings and this fills itself in.</p>}
       </fieldset>
       <fieldset className="question-block">
         <legend>How do you want to feel?</legend>
@@ -1376,12 +1626,17 @@ function OutfitView({ items, blobUrls, repeatDays, onSuggest, onWearOutfit, onAd
           {VIBES.map((vibe) => <ChoiceButton key={vibe} active={preferences.vibe === vibe} onClick={() => setPreferences((current) => ({ ...current, vibe }))}>{vibe}</ChoiceButton>)}
         </div>
       </fieldset>
-      <label className="wanted-select">Want to wear something specific?<select value={preferences.wantedItemId} onChange={(event) => setPreferences((current) => ({ ...current, wantedItemId: event.target.value }))}><option value="">No preference — surprise me</option>{items.map((item) => <option key={item.id} value={item.id}>{displayCategory(item.category)} · {item.colors.join(', ') || 'untitled item'}</option>)}</select></label>
+      <label className="wanted-select">Want to wear something specific?<select value={preferences.wantedItemId} onChange={(event) => setPreferences((current) => ({ ...current, wantedItemId: event.target.value }))}><option value="">No preference — surprise me</option>{availableItems.map((item) => <option key={item.id} value={item.id}>{displayCategory(item.category)} · {item.colors.join(', ') || 'untitled item'}</option>)}</select></label>
       <button className="primary-button full-width suggest-button" type="button" disabled={isThinking} onClick={() => requestSuggestion()}>{isThinking ? <><span className="button-spinner" /> Styling your look…</> : <>Suggest my outfit <span>✦</span></>}</button>
       <div className="outfit-secondary-actions">
         <button className="secondary-button" type="button" onClick={() => requestShuffle()}>Shuffle instead <span>↻</span></button>
         <button className="secondary-button" type="button" onClick={onBuildOwn}>Build it myself <span>→</span></button>
       </div>
+      <button className="photo-check-strip" type="button" onClick={onOpenPhotoCheck}>
+        <span aria-hidden="true">◎</span>
+        <span><strong>Already dressed?</strong><small>Snap a mirror photo to log it and get honest feedback</small></span>
+        <span className="arrow">→</span>
+      </button>
     </section>
   );
 }
@@ -1390,11 +1645,19 @@ function ChoiceButton({ active, children, onClick }) {
   return <button className={`choice-button ${active ? 'is-selected' : ''}`} type="button" onClick={onClick}>{children}</button>;
 }
 
-function JournalView({ items, blobUrls, outfitRecords, onPlanOutfit, onDeleteOutfitRecord, onAdd }) {
+const JOURNAL_BADGES = { worn: 'Worn', planned: 'Planned', loved: 'Loved' };
+
+function JournalView({
+  items, blobUrls, outfitRecords, onPlanOutfit, onDeleteOutfitRecord, onAllowAgain, onOpenPhotoCheck,
+  onSavePlan, buildCapsule, onAdd, onToast, feedback, repeatDays, weatherLocation,
+}) {
   const [segment, setSegment] = useState('history');
+  const [showHidden, setShowHidden] = useState(false);
   const stats = useMemo(() => computeWardrobeStats(items, outfitRecords), [items, outfitRecords]);
   const itemsById = useMemo(() => new Map(items.map((item) => [item.id, item])), [items]);
   const outfitThumbs = (record) => record.itemIds.map((id) => itemsById.get(id)).filter(Boolean);
+  const visibleRecords = outfitRecords.filter((record) => record.status !== 'rejected');
+  const ruledOut = outfitRecords.filter((record) => record.status === 'rejected');
 
   if (!items.length) {
     return (
@@ -1415,16 +1678,28 @@ function JournalView({ items, blobUrls, outfitRecords, onPlanOutfit, onDeleteOut
       <div className="screen-heading"><div><p className="eyebrow">JOURNAL</p><h1>What you’ve worn</h1></div></div>
 
       <div className="segment-toggle" role="tablist">
-        <button className={`segment-button ${segment === 'history' ? 'is-selected' : ''}`} type="button" role="tab" aria-selected={segment === 'history'} onClick={() => setSegment('history')}>History &amp; plans</button>
+        <button className={`segment-button ${segment === 'history' ? 'is-selected' : ''}`} type="button" role="tab" aria-selected={segment === 'history'} onClick={() => setSegment('history')}>History</button>
+        <button className={`segment-button ${segment === 'plan' ? 'is-selected' : ''}`} type="button" role="tab" aria-selected={segment === 'plan'} onClick={() => setSegment('plan')}>Plan ahead</button>
         <button className={`segment-button ${segment === 'stats' ? 'is-selected' : ''}`} type="button" role="tab" aria-selected={segment === 'stats'} onClick={() => setSegment('stats')}>Stats</button>
       </div>
 
-      {segment === 'history' ? (
+      {segment === 'plan' && (
+        <div className="planner-stack">
+          <WeekPlanner items={items} blobUrls={blobUrls} feedback={feedback} repeatDays={repeatDays} weatherLocation={weatherLocation} onSavePlan={onSavePlan} />
+          <TripPlanner items={items} blobUrls={blobUrls} feedback={feedback} onSavePlan={onSavePlan} onToast={onToast} />
+          <CapsuleBuilder items={items} blobUrls={blobUrls} buildCapsule={buildCapsule} onToast={onToast} />
+        </div>
+      )}
+
+      {segment === 'history' && (
         <>
-          <button className="secondary-button full-width" type="button" onClick={onPlanOutfit}>＋ Plan an outfit</button>
-          {outfitRecords.length ? (
+          <div className="outfit-secondary-actions">
+            <button className="secondary-button" type="button" onClick={onPlanOutfit}>＋ Plan an outfit</button>
+            <button className="secondary-button" type="button" onClick={onOpenPhotoCheck}>◎ Log from a photo</button>
+          </div>
+          {visibleRecords.length ? (
             <div className="journal-list">
-              {outfitRecords.map((record) => (
+              {visibleRecords.map((record) => (
                 <div className="journal-row" key={record.id}>
                   <div className="journal-row-photos">
                     {outfitThumbs(record).slice(0, 4).map((item) => (
@@ -1433,7 +1708,7 @@ function JournalView({ items, blobUrls, outfitRecords, onPlanOutfit, onDeleteOut
                   </div>
                   <div className="journal-row-copy">
                     <strong>{formatDate(record.date)}</strong>
-                    <span className={`journal-badge journal-badge-${record.status}`}>{record.status === 'worn' ? 'Worn' : 'Planned'}</span>
+                    <span className={`journal-badge journal-badge-${record.status}`}>{JOURNAL_BADGES[record.status]}</span>
                     {record.occasion && <small>{record.occasion}</small>}
                   </div>
                   <button className="icon-text-button danger-text" type="button" onClick={() => onDeleteOutfitRecord(record.id)} aria-label="Remove this entry">×</button>
@@ -1441,10 +1716,35 @@ function JournalView({ items, blobUrls, outfitRecords, onPlanOutfit, onDeleteOut
               ))}
             </div>
           ) : (
-            <p className="inline-note">Nothing logged yet. Wear a suggested outfit, or plan one ahead.</p>
+            <p className="inline-note">Nothing logged yet. Wear a suggested outfit, log one from a photo, or plan one ahead.</p>
+          )}
+
+          {ruledOut.length > 0 && (
+            <section className="ruled-out">
+              <button className="text-button" type="button" aria-expanded={showHidden} onClick={() => setShowHidden((current) => !current)}>
+                {showHidden ? 'Hide' : 'Show'} pairings you ruled out ({ruledOut.length})
+              </button>
+              {showHidden && (
+                <div className="journal-list">
+                  {ruledOut.map((record) => (
+                    <div className="journal-row" key={record.id}>
+                      <div className="journal-row-photos">
+                        {outfitThumbs(record).slice(0, 4).map((item) => (
+                          <Photo key={item.id} item={item} blobUrls={blobUrls} className="journal-photo" alt={displayCategory(item.category)} />
+                        ))}
+                      </div>
+                      <div className="journal-row-copy"><small>Not suggested again</small></div>
+                      <button className="text-button" type="button" onClick={() => onAllowAgain(record.id)}>Allow again</button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </section>
           )}
         </>
-      ) : (
+      )}
+
+      {segment === 'stats' && (
         <div className="stats-panel">
           <div className="stats-summary">
             <div><strong>{stats.totalItems}</strong><span>pieces</span></div>
@@ -1505,6 +1805,497 @@ function JournalView({ items, blobUrls, outfitRecords, onPlanOutfit, onDeleteOut
         </div>
       )}
     </section>
+  );
+}
+
+function OutfitThumbs({ itemIds, itemsById, blobUrls, className = 'journal-photo' }) {
+  return (
+    <div className="journal-row-photos">
+      {itemIds.map((id) => itemsById.get(id)).filter(Boolean).map((item) => (
+        <Photo key={item.id} item={item} blobUrls={blobUrls} className={className} alt={`${displayCategory(item.category)}${item.colors.length ? `, ${item.colors.join(' ')}` : ''}`} />
+      ))}
+    </div>
+  );
+}
+
+const MAIN_CATEGORIES = new Set(['top', 'bottom', 'dress']);
+
+/**
+ * Seven days of outfits in one go, with no top, bottom or dress repeated while
+ * there's anything else to wear. Uses the live forecast for each day when it's
+ * on. Local and instant, so it works with no AI and can't be rate-limited.
+ */
+function WeekPlanner({ items, blobUrls, feedback, repeatDays, weatherLocation, onSavePlan }) {
+  const [start, setStart] = useState(() => addDays(localDate(), 1));
+  const [weekdayOccasion, setWeekdayOccasion] = useState('Work');
+  const [weekendOccasion, setWeekendOccasion] = useState('Everyday');
+  const [plan, setPlan] = useState(null);
+  const [isSaving, setIsSaving] = useState(false);
+  const forecast = useForecast(weatherLocation);
+  const itemsById = useMemo(() => new Map(items.map((item) => [item.id, item])), [items]);
+
+  const generate = () => {
+    const days = Array.from({ length: 7 }, (unused, index) => {
+      const date = addDays(start, index);
+      const day = forecast.days?.find((entry) => entry.date === date) || null;
+      return {
+        date,
+        occasion: isWeekend(date) ? weekendOccasion : weekdayOccasion,
+        weather: day?.weather || 'any',
+        rain: Boolean(day?.rain),
+        forecast: day,
+      };
+    });
+    setPlan(planOutfitsForDays(items, days, { repeatDays, feedback }));
+  };
+
+  const reshuffleDay = (index) => {
+    setPlan((current) => {
+      const usedElsewhere = new Set(current.filter((unused, other) => other !== index).flatMap((day) => day.itemIds));
+      const thisDay = new Set(current[index].itemIds);
+      const without = (ids) => items.filter((item) => !(MAIN_CATEGORIES.has(item.category) && ids.has(item.id)));
+      // Most to least picky: nothing worn on any other day and different from
+      // this day's pick; then just different from this day's pick; then
+      // anything. A small wardrobe can't satisfy the first, and a top on its
+      // own is worse than a repeat.
+      const pools = [without(new Set([...usedElsewhere, ...thisDay])), without(thisDay), items];
+      let next = current[index];
+      for (const pool of pools) {
+        const [candidate] = planOutfitsForDays(pool, [current[index]], { repeatDays, feedback });
+        if (isCompleteOutfit(candidate.itemIds, itemsById)) {
+          next = candidate;
+          break;
+        }
+      }
+      return current.map((day, other) => (other === index ? next : day));
+    });
+  };
+
+  const save = async () => {
+    setIsSaving(true);
+    const saved = await onSavePlan(plan, { source: 'week' });
+    setIsSaving(false);
+    if (saved) setPlan(null);
+  };
+
+  return (
+    <section className="settings-card planner-card">
+      <div className="settings-card-heading"><span className="settings-icon">▤</span><div><h2>Plan my week</h2><p>Seven outfits, no top or bottom repeated while there are others to wear.</p></div></div>
+      {!plan ? (
+        <>
+          <div className="form-grid">
+            <label className="span-two">Starting<input type="date" value={start} onChange={(event) => setStart(event.target.value || addDays(localDate(), 1))} /></label>
+            <label>Weekdays<select value={weekdayOccasion} onChange={(event) => setWeekdayOccasion(event.target.value)}>{OCCASIONS.map((option) => <option key={option}>{option}</option>)}</select></label>
+            <label>Weekend<select value={weekendOccasion} onChange={(event) => setWeekendOccasion(event.target.value)}>{OCCASIONS.map((option) => <option key={option}>{option}</option>)}</select></label>
+          </div>
+          <p className="field-hint">{weatherLocation ? (forecast.days ? `Uses the forecast for ${weatherLocation.shortName}.` : 'Loading the forecast…') : 'Turn on live weather in Settings to plan around the forecast.'}</p>
+          <button className="primary-button full-width" type="button" disabled={!items.some(isAvailable)} onClick={generate}>Plan 7 days <span>→</span></button>
+        </>
+      ) : (
+        <>
+          <div className="plan-list">
+            {plan.map((day, index) => (
+              <div className="plan-day" key={day.date}>
+                <div className="plan-day-label">
+                  <strong>{weekday(day.date)} {formatDate(day.date)}</strong>
+                  <small>{day.occasion}{day.forecast ? ` · ${describeDay(day.forecast)}` : ''}</small>
+                </div>
+                {day.itemIds.length
+                  ? <OutfitThumbs itemIds={day.itemIds} itemsById={itemsById} blobUrls={blobUrls} />
+                  : <small className="plan-empty">Nothing suitable</small>}
+                <button className="icon-text-button" type="button" onClick={() => reshuffleDay(index)} aria-label={`Shuffle ${weekday(day.date)}`}>↻</button>
+              </div>
+            ))}
+          </div>
+          <button className="primary-button full-width" type="button" disabled={isSaving} onClick={save}>{isSaving ? 'Saving…' : 'Save to my journal'}</button>
+          <button className="text-button" type="button" onClick={() => setPlan(null)}>Start over</button>
+        </>
+      )}
+    </section>
+  );
+}
+
+/**
+ * A packing list and day-by-day outfits for a trip, sized to the fewest pieces
+ * that cover every day. Uses the destination's forecast for any day within
+ * the next 16 days, and the chosen climate for the rest.
+ */
+function TripPlanner({ items, blobUrls, feedback, onSavePlan, onToast }) {
+  const [query, setQuery] = useState('');
+  const [places, setPlaces] = useState([]);
+  const [place, setPlace] = useState(null);
+  const [start, setStart] = useState(() => addDays(localDate(), 7));
+  const [length, setLength] = useState(4);
+  const [occasion, setOccasion] = useState('Everyday');
+  const [climate, setClimate] = useState('mild');
+  const [trip, setTrip] = useState(null);
+  const [packed, setPacked] = useState([]);
+  const [isBusy, setIsBusy] = useState(false);
+  const itemsById = useMemo(() => new Map(items.map((item) => [item.id, item])), [items]);
+
+  const search = async (event) => {
+    event.preventDefault();
+    setIsBusy(true);
+    try {
+      const found = await searchPlaces(query);
+      setPlaces(found);
+      if (!found.length) onToast('No place by that name. Try a nearby city.');
+    } catch (error) {
+      onToast(error.message);
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  const generate = async () => {
+    setIsBusy(true);
+    let forecastDays = [];
+    if (place) {
+      try {
+        forecastDays = await loadForecast(place);
+      } catch (error) {
+        onToast(`${error.message} Using the climate you chose instead.`);
+      }
+    }
+    const days = Array.from({ length }, (unused, index) => {
+      const date = addDays(start, index);
+      const day = forecastDays.find((entry) => entry.date === date) || null;
+      return { date, occasion, weather: day?.weather || climate, rain: Boolean(day?.rain), forecast: day };
+    });
+    const result = packForTrip(items, days, { occasion, feedback });
+    setTrip({ ...result, covered: days.filter((day) => day.forecast).length, days: days.length });
+    setPacked([]);
+    setIsBusy(false);
+  };
+
+  const save = async () => {
+    setIsBusy(true);
+    const saved = await onSavePlan(trip.outfits, { source: 'trip', occasion: place ? `Trip to ${place.shortName}` : 'Trip' });
+    setIsBusy(false);
+    if (saved) setTrip(null);
+  };
+
+  const togglePacked = (id) => setPacked((current) => (current.includes(id) ? current.filter((entry) => entry !== id) : [...current, id]));
+
+  return (
+    <section className="settings-card planner-card">
+      <div className="settings-card-heading"><span className="settings-icon">✈</span><div><h2>Pack for a trip</h2><p>The fewest pieces that cover every day, with an outfit for each.</p></div></div>
+      {!trip ? (
+        <>
+          <form className="place-search" onSubmit={search}>
+            <input value={query} onChange={(event) => { setQuery(event.target.value); setPlace(null); }} placeholder="Where to? (optional)" aria-label="Destination" />
+            <button className="secondary-button compact" type="submit" disabled={isBusy || query.trim().length < 2}>Find</button>
+          </form>
+          {places.length > 0 && !place && (
+            <div className="place-results">
+              {places.map((option) => (
+                <button key={`${option.latitude},${option.longitude}`} className="place-option" type="button" onClick={() => { setPlace(option); setQuery(option.name); setPlaces([]); }}>{option.name}</button>
+              ))}
+            </div>
+          )}
+          <div className="form-grid">
+            <label>Leaving<input type="date" value={start} onChange={(event) => setStart(event.target.value || localDate())} /></label>
+            <label>Days<input type="number" min="1" max="14" value={length} onChange={(event) => setLength(Math.min(14, Math.max(1, Number(event.target.value) || 1)))} /></label>
+            <label className="span-two">Mostly for<select value={occasion} onChange={(event) => setOccasion(event.target.value)}>{OCCASIONS.map((option) => <option key={option}>{option}</option>)}</select></label>
+          </div>
+          <fieldset className="question-block compact-block">
+            <legend>{place ? 'Weather for days beyond the forecast' : 'Expected weather'}</legend>
+            <div className="choice-grid weather-grid">
+              {WEATHER_OPTIONS.map((option) => <ChoiceButton key={option.value} active={climate === option.value} onClick={() => setClimate(option.value)}>{option.label}</ChoiceButton>)}
+            </div>
+          </fieldset>
+          <button className="primary-button full-width" type="button" disabled={isBusy || !items.some(isAvailable)} onClick={generate}>{isBusy ? 'Working…' : 'Make my packing list'}</button>
+        </>
+      ) : (
+        <>
+          <p className="plan-summary">
+            <strong>{plural(trip.packingList.length, 'piece')}</strong> for {plural(trip.days, 'day')}
+            {place ? ` in ${place.shortName}` : ''}.
+            {' '}{trip.covered ? `Forecast used for ${plural(trip.covered, 'day')}${trip.covered < trip.days ? '; your chosen weather for the rest' : ''}.` : 'Planned for the weather you chose.'}
+          </p>
+          <ul className="packing-list">
+            {[...trip.packingList].sort((a, b) => CATEGORIES.indexOf(a.category) - CATEGORIES.indexOf(b.category)).map((item) => (
+              <li key={item.id}>
+                <label>
+                  <input type="checkbox" checked={packed.includes(item.id)} onChange={() => togglePacked(item.id)} />
+                  <Photo item={item} blobUrls={blobUrls} className="packing-photo" alt="" />
+                  <span>{displayCategory(item.category)} · {item.colors.join(', ') || 'untitled'}</span>
+                </label>
+              </li>
+            ))}
+          </ul>
+          <p className="field-hint">{packed.length} of {trip.packingList.length} packed. Ticks aren't saved.</p>
+          <div className="plan-list">
+            {trip.outfits.map((day) => (
+              <div className="plan-day" key={day.date}>
+                <div className="plan-day-label">
+                  <strong>{weekday(day.date)} {formatDate(day.date)}</strong>
+                  <small>{day.forecast ? describeDay(day.forecast) : WEATHER_OPTIONS.find((option) => option.value === day.weather)?.label}</small>
+                </div>
+                <OutfitThumbs itemIds={day.itemIds} itemsById={itemsById} blobUrls={blobUrls} />
+              </div>
+            ))}
+          </div>
+          <button className="primary-button full-width" type="button" disabled={isBusy} onClick={save}>{isBusy ? 'Saving…' : 'Save outfits to my journal'}</button>
+          <button className="text-button" type="button" onClick={() => setTrip(null)}>Start over</button>
+        </>
+      )}
+    </section>
+  );
+}
+
+/**
+ * Asks the AI for a capsule: a small set of owned pieces that mix into the
+ * most outfits, with example outfits made only from those pieces.
+ */
+function CapsuleBuilder({ items, blobUrls, buildCapsule, onToast }) {
+  const [size, setSize] = useState(12);
+  const [season, setSeason] = useState('');
+  const [capsule, setCapsule] = useState(null);
+  const [isBuilding, setIsBuilding] = useState(false);
+  const itemsById = useMemo(() => new Map(items.map((item) => [item.id, item])), [items]);
+  const hasAi = hasAnyProvider();
+
+  const build = async () => {
+    setIsBuilding(true);
+    try {
+      setCapsule(await buildCapsule({ items, size, season }));
+    } catch (error) {
+      onToast(error?.message || 'The capsule could not be built this time.');
+    } finally {
+      setIsBuilding(false);
+    }
+  };
+
+  return (
+    <section className="settings-card planner-card">
+      <div className="settings-card-heading"><span className="settings-icon">◇</span><div><h2>Build a capsule</h2><p>The pieces you own that mix into the most outfits.</p></div></div>
+      {!hasAi && <p className="inline-note">This one uses AI. Connect the built-in AI or a provider in Settings.</p>}
+      <div className="form-grid">
+        <label>Pieces<select value={size} onChange={(event) => setSize(Number(event.target.value))}>{[10, 12, 15].map((option) => <option key={option} value={option}>{option}</option>)}</select></label>
+        <label>Season<select value={season} onChange={(event) => setSeason(event.target.value)}><option value="">Any</option>{['spring', 'summer', 'autumn', 'winter'].map((option) => <option key={option} value={option}>{option[0].toUpperCase() + option.slice(1)}</option>)}</select></label>
+      </div>
+      <button className="primary-button full-width" type="button" disabled={!hasAi || isBuilding || items.filter(isAvailable).length < 4} onClick={build}>
+        {isBuilding ? <><span className="button-spinner" /> Building…</> : capsule ? 'Build another' : 'Build my capsule'}
+      </button>
+      {capsule && (
+        <div className="capsule-result">
+          <OutfitThumbs itemIds={capsule.itemIds} itemsById={itemsById} blobUrls={blobUrls} className="capsule-photo" />
+          {capsule.explanation && <div className="explanation-card"><span>✦</span><p>{capsule.explanation}</p></div>}
+          {capsule.outfits.length > 0 && (
+            <>
+              <h3>{plural(capsule.outfits.length, 'example outfit')}</h3>
+              <div className="plan-list">
+                {capsule.outfits.map((ids, index) => (
+                  <div className="plan-day" key={ids.join('-') || index}>
+                    <OutfitThumbs itemIds={ids} itemsById={itemsById} blobUrls={blobUrls} />
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+/** Escape closes, Tab stays inside, and focus goes back where it was on close. */
+function useModalKeyboard(dialogRef, onClose) {
+  // Held in a ref so a parent re-render (a toast, say) handing down a new
+  // onClose doesn't re-run the effect and yank focus back to the dialog.
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
+
+  useEffect(() => {
+    const opener = document.activeElement;
+    dialogRef.current?.focus();
+
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape') {
+        event.stopPropagation();
+        closeRef.current();
+        return;
+      }
+      if (event.key !== 'Tab') return;
+      const focusable = dialogRef.current?.querySelectorAll('button:not([disabled]), input:not([disabled]), select, textarea, [href]');
+      if (!focusable?.length) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+
+    document.addEventListener('keydown', onKeyDown, true);
+    return () => {
+      document.removeEventListener('keydown', onKeyDown, true);
+      if (opener instanceof HTMLElement) opener.focus();
+    };
+  }, [dialogRef]);
+}
+
+/**
+ * Today's outfit, from one photo: the AI says which saved pieces are being
+ * worn (each one can be corrected before logging) and gives honest written
+ * feedback. No score: a number from a model looking at one photo would be
+ * made up, and the research on other apps found people don't trust it.
+ */
+function OutfitPhotoModal({ items, blobUrls, analyze, weatherLocation, onClose, onLog, onToast }) {
+  const [file, setFile] = useState(null);
+  const [previewUrl, setPreviewUrl] = useState('');
+  const [occasion, setOccasion] = useState('Everyday');
+  const [result, setResult] = useState(null);
+  const [matches, setMatches] = useState([]);
+  const [isReading, setIsReading] = useState(false);
+  const [isLogged, setIsLogged] = useState(false);
+  const dialogRef = useRef(null);
+  const inputRef = useRef(null);
+  const forecast = useForecast(weatherLocation);
+  const today = forecast.days?.find((day) => day.date === localDate()) || null;
+  const itemsById = useMemo(() => new Map(items.map((item) => [item.id, item])), [items]);
+  const hasAi = hasAnyProvider();
+  useModalKeyboard(dialogRef, onClose);
+
+  useEffect(() => {
+    if (!file) {
+      setPreviewUrl('');
+      return undefined;
+    }
+    const url = URL.createObjectURL(file);
+    setPreviewUrl(url);
+    return () => URL.revokeObjectURL(url);
+  }, [file]);
+
+  const choose = (event) => {
+    const picked = event.target.files?.[0];
+    event.target.value = '';
+    if (!picked) return;
+    setFile(picked);
+    setResult(null);
+    setIsLogged(false);
+  };
+
+  const read = async () => {
+    setIsReading(true);
+    try {
+      const analysis = await analyze(file, { items, occasion, forecastNote: forecastNote(today, weatherLocation?.shortName) });
+      setResult(analysis);
+      setMatches(analysis.wearing.map((entry) => entry.itemId));
+    } catch (error) {
+      onToast(error?.message || 'That photo could not be read. Try again.');
+    } finally {
+      setIsReading(false);
+    }
+  };
+
+  const matchedIds = [...new Set(matches.filter(Boolean))];
+
+  const log = async () => {
+    try {
+      await onLog(matchedIds, result?.verdict || '');
+      setIsLogged(true);
+    } catch (error) {
+      onToast(error?.message || 'That outfit could not be logged.');
+    }
+  };
+
+  const describe = (item) => `${displayCategory(item.category)} · ${item.colors.join(', ') || 'untitled'}`;
+
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <section className="item-editor photo-check" role="dialog" aria-modal="true" aria-labelledby="photo-check-title" ref={dialogRef} tabIndex={-1}>
+        <div className="modal-handle" />
+        <div className="editor-header">
+          <div><p className="eyebrow">TODAY'S OUTFIT</p><h2 id="photo-check-title">Log it and get feedback</h2></div>
+          <button className="close-button" type="button" onClick={onClose} aria-label="Close">×</button>
+        </div>
+
+        <input ref={inputRef} type="file" accept="image/*" hidden onChange={choose} />
+        {previewUrl
+          ? <img className="photo-check-preview" src={previewUrl} alt="Your outfit photo" />
+          : (
+            <button className="photo-check-pick" type="button" onClick={() => inputRef.current?.click()}>
+              <span aria-hidden="true">◎</span>
+              <strong>Take or choose a photo</strong>
+              <small>A mirror selfie works best. Only this photo is sent to your AI provider.</small>
+            </button>
+          )}
+
+        {!hasAi && <p className="inline-note">This uses AI. Connect the built-in AI or a provider in Settings.</p>}
+
+        {file && !result && (
+          <>
+            <label className="wanted-select">Dressed for<select value={occasion} onChange={(event) => setOccasion(event.target.value)}>{OCCASIONS.map((option) => <option key={option}>{option}</option>)}</select></label>
+            <button className="primary-button full-width" type="button" disabled={!hasAi || isReading} onClick={read}>
+              {isReading ? <><span className="button-spinner" /> Looking…</> : <>Read my outfit <span>✦</span></>}
+            </button>
+            <button className="text-button" type="button" onClick={() => inputRef.current?.click()}>Use a different photo</button>
+          </>
+        )}
+
+        {result && (
+          <>
+            <div className="explanation-card"><span>✦</span><p>{result.verdict || 'Here\'s what I see.'}</p></div>
+            {result.working.length > 0 && (
+              <section className="feedback-section">
+                <h3>Working</h3>
+                <ul>{result.working.map((line) => <li key={line}>{line}</li>)}</ul>
+              </section>
+            )}
+            {result.tweaks.length > 0 && (
+              <section className="feedback-section">
+                <h3>Worth trying</h3>
+                <ul>
+                  {result.tweaks.map((tweak) => {
+                    const swap = tweak.swapItemId ? itemsById.get(tweak.swapItemId) : null;
+                    return (
+                      <li key={tweak.suggestion} className={swap ? 'has-swap' : ''}>
+                        <span>{tweak.suggestion}</span>
+                        {swap && <span className="swap-chip"><Photo item={swap} blobUrls={blobUrls} className="swap-photo" alt="" />{describe(swap)}</span>}
+                      </li>
+                    );
+                  })}
+                </ul>
+              </section>
+            )}
+
+            <section className="feedback-section">
+              <h3>What you're wearing</h3>
+              {result.wearing.length ? (
+                <ul className="match-list">
+                  {result.wearing.map((entry, index) => {
+                    const chosen = matches[index] ? itemsById.get(matches[index]) : null;
+                    const options = items.filter((item) => item.category === entry.category || item.id === matches[index]);
+                    return (
+                      <li key={`${entry.description}-${index}`}>
+                        {chosen ? <Photo item={chosen} blobUrls={blobUrls} className="match-photo" alt="" /> : <span className="match-photo photo-placeholder"><span>?</span></span>}
+                        <label>
+                          <small>{entry.description || displayCategory(entry.category)}</small>
+                          <select value={matches[index] || ''} disabled={isLogged} onChange={(event) => setMatches((current) => current.map((value, other) => (other === index ? event.target.value : value)))}>
+                            <option value="">Not in my wardrobe</option>
+                            {options.map((item) => <option key={item.id} value={item.id}>{describe(item)}</option>)}
+                          </select>
+                        </label>
+                      </li>
+                    );
+                  })}
+                </ul>
+              ) : <p className="field-hint">No clothes were picked out of this photo.</p>}
+            </section>
+
+            <button className={`primary-button full-width ${isLogged ? 'success-button' : ''}`} type="button" disabled={isLogged || !matchedIds.length} onClick={log}>
+              {isLogged ? '✓ Logged for today' : matchedIds.length ? `Log ${plural(matchedIds.length, 'piece')} as worn today` : 'Nothing matched to log'}
+            </button>
+            {!isLogged && <button className="text-button" type="button" onClick={() => inputRef.current?.click()}>Try another photo</button>}
+          </>
+        )}
+      </section>
+    </div>
   );
 }
 
@@ -1705,7 +2496,77 @@ function BackupCard({ exportBackup, onRestore, onToast, dataKey }) {
   );
 }
 
-function SettingsView({ onClear, exportBackup, onRestore, onToast, dataKey }) {
+/**
+ * Live weather is off until switched on here. A typed city never touches the
+ * device's location; "use my location" rounds it to about 10 km first.
+ */
+function WeatherCard({ location, onChange, onToast }) {
+  const [query, setQuery] = useState('');
+  const [places, setPlaces] = useState([]);
+  const [isBusy, setIsBusy] = useState(false);
+  const forecast = useForecast(location);
+  const today = forecast.days?.find((day) => day.date === localDate()) || null;
+
+  const choose = (place) => {
+    onChange(place);
+    setPlaces([]);
+    setQuery('');
+    onToast(`Live weather on for ${place.name}.`);
+  };
+
+  const search = async (event) => {
+    event.preventDefault();
+    setIsBusy(true);
+    try {
+      const found = await searchPlaces(query);
+      setPlaces(found);
+      if (!found.length) onToast('No place by that name. Try a nearby city.');
+    } catch (error) {
+      onToast(error.message);
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  const useDevice = async () => {
+    setIsBusy(true);
+    try {
+      choose(await currentRoundedPosition());
+    } catch (error) {
+      onToast(error.message);
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  return (
+    <section className="settings-card">
+      <div className="settings-card-heading"><span className="settings-icon">☁</span><div><h2>Live weather</h2><p>Fills in the weather on the Outfit screen, and plans your week around the forecast.</p></div></div>
+      {location ? (
+        <>
+          <p className="forecast-line"><strong>{location.name}</strong>{today ? ` · today ${describeDay(today)}` : forecast.error ? ` · ${forecast.error}` : ''}</p>
+          <button className="secondary-button full-width" type="button" onClick={() => { onChange(null); onToast('Live weather off.'); }}>Turn off live weather</button>
+        </>
+      ) : (
+        <>
+          <form className="place-search" onSubmit={search}>
+            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Your city" aria-label="City for live weather" />
+            <button className="secondary-button compact" type="submit" disabled={isBusy || query.trim().length < 2}>Find</button>
+          </form>
+          {places.length > 0 && (
+            <div className="place-results">
+              {places.map((place) => <button key={`${place.latitude},${place.longitude}`} className="place-option" type="button" onClick={() => choose(place)}>{place.name}</button>)}
+            </div>
+          )}
+          <button className="text-button" type="button" disabled={isBusy} onClick={useDevice}>Or use my location (rounded to about 10 km)</button>
+        </>
+      )}
+      <p className="privacy-note"><span>⌁</span>Forecasts come from Open-Meteo, free and with no account. Only the rounded place is sent, never your wardrobe.</p>
+    </section>
+  );
+}
+
+function SettingsView({ onClear, exportBackup, onRestore, onToast, dataKey, weatherLocation, onWeatherLocationChange }) {
   const [providers, setProviders] = useState(getProviders);
   const [activeId, setActiveId] = useState(getActiveProviderId);
   // null = nothing open, 'new' = the add-provider form, or a provider id being edited.
@@ -1816,6 +2677,8 @@ function SettingsView({ onClear, exportBackup, onRestore, onToast, dataKey }) {
 
         <p className="privacy-note"><span>⌁</span>Each provider's key is saved locally on this device and is sent only to that provider, and only when you use a feature that needs it.</p>
       </section>
+
+      <WeatherCard location={weatherLocation} onChange={onWeatherLocationChange} onToast={onToast} />
 
       <section className="settings-card">
         <div className="settings-card-heading"><span className="settings-icon">◷</span><div><h2>Repeat protection</h2><p>Deprioritise pieces you wore recently.</p></div></div>
@@ -2083,6 +2946,12 @@ function ItemEditor({ item, blobUrls, onClose, onSave, onDelete }) {
           <label className="span-two">Style tags<input value={draft.styleTags.join(', ')} placeholder="e.g. relaxed, smart casual" onChange={(event) => updateList('styleTags', event.target.value)} /></label>
           <label className="span-two">Season / weather<input value={draft.seasons.join(', ')} placeholder="e.g. cool, autumn" onChange={(event) => updateList('seasons', event.target.value)} /><small className="field-hint">{SEASON_HINT}</small></label>
           <label className="span-two">Notes<textarea value={draft.notes} rows="3" placeholder="Fit notes, how you like to wear it…" onChange={(event) => update({ notes: event.target.value })} /></label>
+          <label className="span-two">Availability
+            <select value={draft.unavailable} onChange={(event) => update({ unavailable: event.target.value })}>
+              <option value="">In rotation — can be suggested</option>
+              {UNAVAILABLE_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+            </select>
+          </label>
           <label>Price paid <span className="field-hint-inline">(optional)</span><input type="number" min="0" step="0.01" inputMode="decimal" value={draft.pricePaid ?? ''} placeholder="for cost-per-wear" onChange={(event) => update({ pricePaid: event.target.value === '' ? null : Number(event.target.value) })} /></label>
           <div className="last-worn-row"><span>Last worn</span><strong>{formatDate(draft.lastWornDate)}</strong></div>
         </div>

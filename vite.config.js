@@ -14,6 +14,26 @@ function builtInAiDevRoute(env) {
         let raw = "";
         req.on("data", (chunk) => { raw += chunk; });
         req.on("end", async () => {
+          // BUILTIN_AI_UPSTREAM (e.g. the deployed site) forwards to that site's
+          // route instead, so local testing can use the key held on the host
+          // without copying it onto the development machine.
+          if (env.BUILTIN_AI_UPSTREAM) {
+            try {
+              const upstream = await fetch(`${env.BUILTIN_AI_UPSTREAM.replace(/\/+$/, "")}/api/gemini/chat/completions`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json", Authorization: req.headers.authorization || "" },
+                body: raw,
+              });
+              res.statusCode = upstream.status;
+              res.setHeader("Content-Type", "application/json");
+              res.end(await upstream.text());
+            } catch {
+              res.statusCode = 502;
+              res.setHeader("Content-Type", "application/json");
+              res.end(JSON.stringify({ error: { message: "Could not reach BUILTIN_AI_UPSTREAM." } }));
+            }
+            return;
+          }
           let body = null;
           try { body = raw ? JSON.parse(raw) : null; } catch { /* rejected below as not JSON */ }
           const result = await handleGeminiProxy({ method: req.method, authorization: req.headers.authorization, body, env });

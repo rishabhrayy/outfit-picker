@@ -12,6 +12,9 @@ It is a Progressive Web App (PWA), so a deployed copy can be installed on a phon
 - Tags one garment or several visible garments from a casual photo, then lets you review and edit the batch before saving.
 - Keeps category, colours, style, season/weather, notes, source-photo, and last-worn information for each item.
 - Filters the local wardrobe before requesting an outfit, gives recently worn items a lower priority, and lets you mark a suggestion as worn.
+- Learns from **Love it** and **Never suggest this**, skips pieces that are **out of rotation** (in the wash, at the cleaner's, being repaired), and can fill in the weather from a **live forecast**.
+- Logs **today's outfit from one mirror photo**, matched to your saved pieces, with honest written feedback.
+- **Plans a week** of outfits, **packs for a trip**, and **builds a capsule** from what you already own (see [Planning and feedback](#planning-and-feedback)).
 - Backs the whole wardrobe up to one file and restores it, here or on another device (see [Backup and restore](#backup-and-restore)).
 - Works with any OpenAI-compatible AI provider — add as many as you like in Settings and switch between them.
 
@@ -47,6 +50,18 @@ The key is only needed for the two AI features. Without one you can still add ph
 ### Season and weather vocabulary
 
 **Season / weather** is a controlled list, so words outside it are dropped when an item is saved. The recognised values are `spring`, `summer`, `autumn`, `winter`, `all-season`, `cold`, `cool`, `mild`, `warm`, `hot`, `rainy`, and `windy`. **Style tags** is free text and is the right place for anything else.
+
+## Planning and feedback
+
+These came out of reviewing what other wardrobe apps offer and what reviewers complain about: people stop logging what they wear because it's tedious, and AI suggestions that ignore feedback lose trust.
+
+- **Out of rotation.** Mark a piece as in the wash, at the dry cleaner, needing repair, or away, from the item editor or several at once in **Select pieces**. Suggestions, shuffles, week plans, trips and capsules all skip it until it's back. On laundry day, filter by **Out of rotation**, **Select all**, then **Back in rotation**.
+- **Love it / Never suggest this.** On any suggestion. A loved outfit nudges its pieces up the ranking (capped, so it never beats the weather) and is shown to the AI stylist as a guide to your taste. **Never suggest this** rules out the defining pairing (the top with that bottom, or the dress with those shoes), not every piece in the outfit, and the shuffle and local pick avoid it whenever another choice exists. If the AI returns a ruled-out pairing anyway, it isn't shown. Both are ordinary records in the journal, so they're backed up, and **Journal > Show pairings you ruled out > Allow again** undoes one.
+- **Live weather** (Settings, off by default). Type a city, or use your location rounded to about 10 km before it's stored or sent. Forecasts come from [Open-Meteo](https://open-meteo.com), which is free and needs no account. The Outfit screen then fills in the weather, shows the day's range and rain chance, and tells the AI stylist the forecast. Tapping a weather chip overrides it for that request.
+- **Today's outfit from a photo** (Outfit > **Already dressed?**, or Journal > **Log from a photo**). One AI call reads the photo: which saved pieces you're wearing, each correctable from a list before logging, plus written feedback on what works and what's worth trying, sometimes naming a piece from your wardrobe to swap in. There's deliberately no score; a number from a model looking at one photo would be made up. Only that photo and text about your wardrobe are sent, never your wardrobe photos.
+- **Plan my week** (Journal > **Plan ahead**). Seven outfits with no top, bottom or dress repeated until each has been worn, separate occasions for weekdays and the weekend, and each day dressed for its forecast when live weather is on. Local and instant, so it works without AI and can't be rate-limited partway through. ↻ reshuffles one day; **Save to my journal** saves them as planned outfits.
+- **Pack for a trip.** The fewest pieces that cover every day: bottoms and shoes are re-worn, tops rotate, neutral colours are preferred because they pair with more, and one layer is packed only if a day is cold or wet. With a destination, its forecast is used for any day in the next 16; otherwise, or beyond that, the weather you pick. Produces a tick-off packing list and an outfit per day.
+- **Build a capsule** (needs AI). The AI picks 10, 12 or 15 of your available pieces that mix into the most outfits, with example outfits made only from those pieces. Anything it names that isn't in the capsule is dropped.
 
 ## Requirements
 
@@ -90,7 +105,7 @@ To set it up on Vercel:
 3. Redeploy (**Deployments > ⋯ > Redeploy**). Environment variables only apply to new deployments.
 4. In the app, go to **Settings**, type the passcode under **Use the built-in AI**, and select **Connect**.
 
-Until both variables are set, the route answers "not set up yet" and refuses every request. To run it locally, put the same two variables in `.env.local` (git-ignored) and use `npm run dev`. To change the passcode, change `APP_PASSCODE`, redeploy, then remove and reconnect the built-in AI on each device.
+Until both variables are set, the route answers "not set up yet" and refuses every request. To run it locally, put the same two variables in `.env.local` (git-ignored) and use `npm run dev`. Or, to use the key already on the host without copying it to your machine, put `BUILTIN_AI_UPSTREAM=https://your-deployed-site` in `.env.local` instead, and the dev server forwards the route there. To change the passcode, change `APP_PASSCODE`, redeploy, then remove and reconnect the built-in AI on each device.
 
 Bring-your-own-key providers below still work alongside it.
 
@@ -113,7 +128,8 @@ Use this only on a device and browser profile you control. Someone with access t
 
 - Wardrobe items and image blobs stay in IndexedDB for the browser profile where they were added. There is no account, backend database, or cloud sync; moving a wardrobe between devices is a backup file you control.
 - Saved API keys live separately in `localStorage`, one per provider; they are not bundled into the deployed app.
-- When auto-tagging, the selected image is sent to the chosen provider. When suggesting an outfit, the app sends the relevant item metadata and last-worn dates, rather than re-sending the item images.
+- When auto-tagging, the selected image is sent to the chosen provider. When suggesting an outfit, the app sends the relevant item metadata and last-worn dates, rather than re-sending the item images. Reading today's outfit photo sends that one photo plus the same kind of text about your wardrobe; building a capsule sends text only.
+- Live weather is off until you turn it on. When on, only a city's coordinates, or your location rounded to about 10 km, go to Open-Meteo; nothing about your wardrobe does.
 - **Clear wardrobe data** permanently removes the local wardrobe records and their stored photo blobs. It leaves your saved keys alone. Clearing browser/site data removes the wardrobe and the keys.
 
 Browser storage can be cleared by browser settings, private-browsing behaviour, device cleanup tools, or a profile reset, so download a backup now and then.
@@ -143,7 +159,7 @@ A backup is built in memory as one file with the photos inside as base64, so a v
 npm test
 ```
 
-144 tests (Vitest, with `fake-indexeddb` standing in for the browser and a stubbed `fetch` standing in for every AI provider):
+182 tests (Vitest, with `fake-indexeddb` standing in for the browser and a stubbed `fetch` standing in for every AI provider):
 
 - **Backup**: round-trips photo bytes exactly, restores by id without duplicating or deleting, skips items whose photo is missing, never contains a key, and rejects bad files.
 - **AI requests**: what each of the four structured-output modes (strict schema, forced tool call, JSON object, plain text) actually sends and how it reads the reply; the auto-detect ladder stepping down in order, and *not* burning four calls on a rejected key or a rate limit; the retry on the stronger model (for outfits too, but never after a rejected key, a timeout or a lost connection); the Anthropic browser-access header; timeouts and cancelling; and the wording of every error message a person can hit.
@@ -152,6 +168,9 @@ npm test
 - **Bulk edit**: adding a tag merges into each item's own tags rather than replacing them, and a season change is split back into stored season and weather.
 - **Share sheet**: iPhone home-screen detection, the JSON-then-text fallback, and that `share()` starts before anything is awaited.
 - **Outfit logic and key detection**: weather ranking that never drops a category, a requested item always kept, no dress mixed with separates, and key mismatch warnings that fire for a real mismatch but not for providers that share a prefix.
+- **Planning and feedback**: out-of-rotation pieces never suggested unless asked for by name; a ruled-out pairing never shuffled while another exists, but an outfit still made when every pairing is ruled out; loved pieces nudged up but never past the weather; a week plan with every day complete and no top or bottom repeated early; a trip packing fewer pieces than days, wearing only what's packed, and adding a layer only for cold or wet days.
+- **Weather**: the forecast turned into the app's weather words; a location sent and stored only rounded to about 10 km; place search; and plain messages when the service is down.
+- **Photo check and capsule**: invented ids dropped, one saved piece never matched twice, capsule outfits limited to capsule pieces, and the fallback-model retry on both.
 
 The suite was also checked the other way round: deliberately breaking the code in eight specific ways (for example, skipping the tool-call tier or letting `share()` wait) makes tests fail each time, so a green run means something. CI runs the tests and a production build on every push.
 
@@ -199,12 +218,13 @@ The current manifest uses `/` as its start URL, so deploy it at the root of a do
 - `src/App.jsx` — every screen, plus `src/App.css` for the styling.
 - `src/services.js` — the only module that joins storage and the API to the UI.
 - `src/lib/db.js` — IndexedDB reads and writes for photos and items.
-- `src/lib/ai.js` — the two AI calls, their prompts, and their JSON schemas.
+- `src/lib/ai.js` — the AI calls (tagging, outfit suggestion, outfit photo, capsule), their prompts, and their JSON schemas.
 - `src/lib/providers.js` — base URLs, model names, and token budgets per provider.
 - `src/lib/image.js` — resize and re-encode a picked photo for storage and upload.
 - `src/lib/crop.js` — crop geometry shared by the review, wardrobe, and editor views.
-- `src/lib/outfit.js` — local shortlisting before an outfit request.
-- `src/lib/settings.js` — the provider choice, per-provider API keys, and repeat window in `localStorage`.
+- `src/lib/outfit.js` — local ranking, shuffle, feedback rules, the week planner and the trip packer.
+- `src/lib/weather.js` — Open-Meteo forecasts and place search, with locations rounded to about 10 km.
+- `src/lib/settings.js` — the provider choice, per-provider API keys, repeat window and weather location in `localStorage`.
 - `src/types.js` — the canonical record shapes and their normalizers.
 - `public/` — app icons: `icon.svg`, `icon-192.png`, `icon-512.png`, `icon-maskable-512.png`, and `apple-touch-icon.png` for iOS.
 - `api/gemini/chat/completions.js` and `server/geminiProxy.js` — the built-in AI route, holding the Gemini key on the host behind a passcode.

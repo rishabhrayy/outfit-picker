@@ -9,6 +9,7 @@ import { getPreset } from './providers.js';
 export const PROVIDERS_STORAGE_KEY = 'outfit-picker-providers';
 export const ACTIVE_PROVIDER_STORAGE_KEY = 'outfit-picker-active-provider';
 export const REPEAT_DAYS_STORAGE_KEY = 'outfit-picker-repeat-days';
+export const WEATHER_LOCATION_STORAGE_KEY = 'outfit-picker-weather-location';
 export const DEFAULT_REPEAT_DAYS = 7;
 export const MAX_REPEAT_DAYS = 21;
 
@@ -216,4 +217,39 @@ export function setRepeatDays(value) {
   const days = Number(value);
   const safe = Number.isFinite(days) ? Math.min(MAX_REPEAT_DAYS, Math.max(0, Math.round(days))) : DEFAULT_REPEAT_DAYS;
   return writeStorage(REPEAT_DAYS_STORAGE_KEY, String(safe));
+}
+
+/**
+ * Where live weather is fetched for, or null when live weather is off (the
+ * default). Coordinates are rounded to one decimal place, about 10 km, so even
+ * this device's own storage never holds a precise location.
+ */
+export function getWeatherLocation() {
+  try {
+    const parsed = JSON.parse(readStorage(WEATHER_LOCATION_STORAGE_KEY) || 'null');
+    const latitude = Number(parsed?.latitude);
+    const longitude = Number(parsed?.longitude);
+    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return null;
+    return {
+      name: String(parsed.name || 'Your area').slice(0, 120),
+      shortName: String(parsed.shortName || parsed.name || 'your area').slice(0, 60),
+      latitude: Math.round(latitude * 10) / 10,
+      longitude: Math.round(longitude * 10) / 10,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function setWeatherLocation(location) {
+  if (!location) {
+    removeStorage(WEATHER_LOCATION_STORAGE_KEY);
+    return true;
+  }
+  return writeStorage(WEATHER_LOCATION_STORAGE_KEY, JSON.stringify({
+    name: location.name,
+    shortName: location.shortName,
+    latitude: Math.round(Number(location.latitude) * 10) / 10,
+    longitude: Math.round(Number(location.longitude) * 10) / 10,
+  }));
 }

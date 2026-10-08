@@ -22,8 +22,13 @@ import {
 } from './lib/db.js';
 import { backupFileName, createBackup, parseBackup, restoreBackup } from './lib/backup.js';
 import { prepareImage } from './lib/image.js';
-import { suggestOutfit as requestOutfit, tagPhoto as requestTags } from './lib/ai.js';
-import { makeWardrobePromptItems } from './lib/outfit.js';
+import {
+  analyzeOutfitPhoto as requestOutfitPhotoAnalysis,
+  buildCapsule as requestCapsule,
+  suggestOutfit as requestOutfit,
+  tagPhoto as requestTags,
+} from './lib/ai.js';
+import { isAvailable, makeWardrobePromptItems } from './lib/outfit.js';
 import { getActiveProvider, updateProvider } from './lib/settings.js';
 import { normalizeSeasons, normalizeWeatherSuitability, toLocalDateString } from './types.js';
 
@@ -59,6 +64,7 @@ function toAppItem(item, photos) {
     notes: item.notes,
     lastWornDate: item.lastWornDate || '',
     pricePaid: item.pricePaid ?? null,
+    unavailable: item.unavailable || '',
     crop: item.crop,
   };
 }
@@ -75,6 +81,7 @@ function toStoredItem(item, sourcePhotoId) {
     notes: item.notes,
     lastWornDate: item.lastWornDate,
     pricePaid: item.pricePaid ?? null,
+    unavailable: item.unavailable || '',
     crop: item.crop,
   };
 }
@@ -162,8 +169,8 @@ export async function recordOutfitWorn({ itemIds, date, source = 'manual', expla
  * does not touch any item's lastWornDate — that only changes once an outfit
  * is actually worn, not when it's merely planned.
  */
-export async function planOutfit({ itemIds, date, occasion = '', explanation = '' }) {
-  return saveOutfitRecord({ itemIds, date, status: 'planned', source: 'manual', occasion, explanation });
+export async function planOutfit({ itemIds, date, occasion = '', explanation = '', source = 'manual' }) {
+  return saveOutfitRecord({ itemIds, date, status: 'planned', source, occasion, explanation });
 }
 
 export async function getOutfitRecords(range) {
@@ -261,7 +268,7 @@ function shortlistCandidates(items, limit) {
   return items.filter((item) => chosen.has(item.id));
 }
 
-export async function suggestOutfit({ items, preferences = {}, excludedItemIds = [], avoidRecentDays = 7 }) {
+export async function suggestOutfit({ items, preferences = {}, excludedItemIds = [], avoidRecentDays = 7, feedback }) {
   const provider = getActiveProvider();
   const wantedItemId = preferences.wantedItemId || '';
   const candidates = makeWardrobePromptItems(shortlistCandidates(items, MAX_CANDIDATES), avoidRecentDays);
@@ -273,10 +280,46 @@ export async function suggestOutfit({ items, preferences = {}, excludedItemIds =
     excludedItemIds: excludedItemIds.filter((id) => id !== wantedItemId),
     avoidRecentDays,
     today: toLocalDateString(),
+    feedback: {
+      blockedPairs: [...(feedback?.blockedPairs || [])].map((key) => key.split('|')),
+      lovedOutfits: feedback?.lovedOutfits || [],
+    },
     provider,
   });
   pinResolvedJsonMode(provider, result.jsonMode);
   return result;
+}
+
+/**
+ * "Love it" or "never suggest this again" on a suggestion. Stored as an
+ * outfit record so it is backed up and restored with everything else, and so
+ * deleting it from the journal undoes it. Never counts as wearing anything.
+ */
+export async function rateOutfit({ itemIds, rating, source = 'manual', explanation = '', occasion = '' }) {
+  if (rating !== 'loved' && rating !== 'rejected') throw new Error('Unknown rating.');
+  return saveOutfitRecord({ itemIds, date: toLocalDateString(), status: rating, source, explanation, occasion });
+}
+
+/** Today's outfit photo: what's being worn (matched to saved pieces) and feedback. */
+export async function analyzeOutfitPhoto(file, { items = [], occasion, forecastNote } = {}) {
+  const provider = getActiveProvider();
+  // Only text about the wardrobe goes with the photo; the wardrobe's own
+  // photos stay on the device.
+  return requestOutfitPhotoAnalysis(file, {
+    provider,
+    wardrobe: makeWardrobePromptItems(items, 0),
+    occasion,
+    forecastNote,
+  });
+}
+
+export async function buildCapsule({ items = [], size, season }) {
+  return requestCapsule({
+    provider: getActiveProvider(),
+    wardrobe: makeWardrobePromptItems(items.filter(isAvailable), 0),
+    size,
+    season,
+  });
 }
 
 export const services = {
@@ -296,6 +339,9 @@ export const services = {
   exportBackup,
   importBackup,
   suggestOutfit,
+  rateOutfit,
+  analyzeOutfitPhoto,
+  buildCapsule,
 };
 
 export default services;

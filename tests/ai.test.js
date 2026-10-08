@@ -6,7 +6,7 @@ vi.mock('../src/lib/image.js', () => ({
   prepareImage: vi.fn(async () => ({ dataUrl: 'data:image/jpeg;base64,PHOTOBYTES' })),
 }));
 
-import { suggestOutfit, tagPhoto, testProvider } from '../src/lib/ai.js';
+import { analyzeOutfitPhoto, buildCapsule, suggestOutfit, tagPhoto, testProvider } from '../src/lib/ai.js';
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -313,6 +313,11 @@ describe('error messages', () => {
       await expect(run(failWith(503, 'The built-in AI is not set up on this site yet: GEMINI_API_KEY and APP_PASSCODE both need to be set on the host.'), builtin()))
         .rejects.toThrow(/GEMINI_API_KEY and APP_PASSCODE/);
     });
+
+    it('says plainly when Google is busy on both models, rather than quoting it', async () => {
+      await expect(run(failWith(503, 'This model is currently experiencing high demand.'), builtin()))
+        .rejects.toThrow('Google\'s AI is busy right now. Wait a minute and try again.');
+    });
   });
 
   it.each([
@@ -595,5 +600,110 @@ describe('testProvider', () => {
   it('counts a reply cut short by the tiny token budget as connected, since a reasoning model can think past 20 tokens', async () => {
     stubFetch(chat({ content: '' }, 'length'));
     expect(await testProvider(makeProvider())).toMatchObject({ ok: true, reply: '' });
+  });
+});
+
+describe('feedback in outfit suggestions', () => {
+  it('tells the model which pairings were ruled out and which outfits were loved', async () => {
+    const calls = stubFetch(asJson(PICK));
+    await outfitCall(makeProvider(), { feedback: { blockedPairs: [['a', 'b'], ['a', 'gone']], lovedOutfits: [['a', 'c'], ['gone']] } });
+    const prompt = calls[0].body.messages[1].content;
+    expect(prompt).toContain('never to suggest these pairings again');
+    expect(prompt).toContain('a with b');
+    // A pair or outfit mentioning a piece not on offer is left out.
+    expect(prompt).not.toContain('gone');
+    expect(prompt).toContain('[a, c]');
+  });
+
+  it('never shows a ruled-out pairing, even if the model returns one', async () => {
+    stubFetch(asJson({ itemIds: ['a', 'b', 'c'], explanation: 'x' }));
+    await expect(outfitCall(makeProvider(), { feedback: { blockedPairs: [['a', 'b']] } })).rejects.toThrow('ruled out');
+  });
+
+  it('passes the forecast through to the stylist', async () => {
+    const calls = stubFetch(asJson(PICK));
+    await outfitCall(makeProvider(), { preferences: { forecastNote: 'Forecast in Melbourne: 4 to 12 degrees Celsius, rain likely (80%).' } });
+    expect(calls[0].body.messages[1].content).toContain('rain likely (80%)');
+  });
+});
+
+describe('analyzeOutfitPhoto', () => {
+  const wardrobe = [
+    { id: 'a', category: 'top', colors: ['navy'], styleTags: [], seasons: [] },
+    { id: 'c', category: 'shoes', colors: ['white'], styleTags: [], seasons: [] },
+  ];
+  const reply = (overrides = {}) => asJson({
+    wearing: [
+      { category: 'top', description: 'navy tee', itemId: 'a' },
+      { category: 'bottom', description: 'black jeans', itemId: '' },
+      { category: 'shoes', description: 'white trainers', itemId: 'c' },
+    ],
+    verdict: 'Clean and easy.',
+    working: ['The navy and white are crisp together.'],
+    tweaks: [{ suggestion: 'Roll the sleeves once.', swapItemId: '' }],
+    ...overrides,
+  });
+
+  it('sends the photo with the wardrobe as text, and returns matches and feedback', async () => {
+    const calls = stubFetch(reply());
+    const result = await analyzeOutfitPhoto(PHOTO, { provider: makeProvider(), wardrobe, occasion: 'Work', forecastNote: 'Forecast: dry.' });
+    const [text, image] = calls[0].body.messages[1].content;
+    expect(text.text).toContain('Occasion: Work');
+    expect(text.text).toContain('Forecast: dry.');
+    expect(text.text).toContain('id: a');
+    expect(image.image_url.url).toBe('data:image/jpeg;base64,PHOTOBYTES');
+    expect(result.wearing.map((entry) => entry.itemId)).toEqual(['a', '', 'c']);
+    expect(result.verdict).toBe('Clean and easy.');
+    expect(result.tweaks).toEqual([{ suggestion: 'Roll the sleeves once.', swapItemId: '' }]);
+  });
+
+  it('drops invented ids, and never matches one saved piece twice', async () => {
+    stubFetch(reply({
+      wearing: [
+        { category: 'top', description: 'tee', itemId: 'a' },
+        { category: 'top', description: 'overshirt', itemId: 'a' },
+        { category: 'bottom', description: 'jeans', itemId: 'made-up' },
+      ],
+      tweaks: [{ suggestion: 'Try other shoes.', swapItemId: 'made-up' }, { suggestion: '', swapItemId: 'c' }],
+    }));
+    const result = await analyzeOutfitPhoto(PHOTO, { provider: makeProvider(), wardrobe });
+    expect(result.wearing.map((entry) => entry.itemId)).toEqual(['a', '', '']);
+    expect(result.tweaks).toEqual([{ suggestion: 'Try other shoes.', swapItemId: '' }]);
+  });
+
+  it('retries on the fallback model when the first is overloaded', async () => {
+    const calls = stubFetch(failWith(503, 'high demand'), reply());
+    await analyzeOutfitPhoto(PHOTO, { provider: makeProvider(), wardrobe });
+    expect(calls.map((call) => call.body.model)).toEqual(['gpt-4o-mini', 'gpt-4o']);
+  });
+});
+
+describe('buildCapsule', () => {
+  const wardrobe = ['t1', 't2', 'b1', 'b2', 's1'].map((id) => ({ id, category: { t: 'top', b: 'bottom', s: 'shoes' }[id[0]], colors: [], styleTags: [], seasons: [] }));
+
+  it('keeps only real ids, and example outfits made only from the capsule', async () => {
+    stubFetch(asJson({
+      itemIds: ['t1', 'b1', 's1', 'ghost', 't1'],
+      outfits: [{ itemIds: ['t1', 'b1', 's1'] }, { itemIds: ['t2', 'b1', 's1'] }, { itemIds: ['ghost', 's1'] }],
+      explanation: 'Neutral and easy to mix.',
+    }));
+    const result = await buildCapsule({ provider: makeProvider(), wardrobe, size: 3 });
+    expect(result.itemIds).toEqual(['t1', 'b1', 's1']);
+    // t2 isn't in the capsule, so that outfit shrinks to b1 + s1; the ghost one is dropped.
+    expect(result.outfits).toEqual([['t1', 'b1', 's1'], ['b1', 's1']]);
+  });
+
+  it('asks for the size and season given', async () => {
+    const calls = stubFetch(asJson({ itemIds: ['t1'], outfits: [], explanation: '' }));
+    await buildCapsule({ provider: makeProvider(), wardrobe, size: 12, season: 'winter' });
+    const prompt = calls[0].body.messages[1].content;
+    expect(prompt).toContain('Number of pieces: 5');
+    expect(prompt).toContain('Season: winter');
+  });
+
+  it('refuses a wardrobe too small to choose from, without a request', async () => {
+    const calls = stubFetch(asJson({}));
+    await expect(buildCapsule({ provider: makeProvider(), wardrobe: wardrobe.slice(0, 2) })).rejects.toThrow('Add a few more pieces');
+    expect(calls).toHaveLength(0);
   });
 });

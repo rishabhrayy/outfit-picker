@@ -323,6 +323,9 @@ export function normalizeWardrobeItem(value = {}, { now = new Date() } = {}) {
     // Optional — only entered if the owner wants cost-per-wear. Never required,
     // and never used for anything shopping-related.
     pricePaid: normalizePositiveNumber(firstDefined(value.pricePaid, value.price_paid)),
+    // '' when the piece is in rotation; otherwise why it can't be worn right
+    // now. Suggestions, shuffles and plans all skip an unavailable piece.
+    unavailable: UNAVAILABLE_REASONS.has(value.unavailable) ? value.unavailable : '',
     crop: normalizeCrop(firstDefined(value.crop, value.cropRect, value.crop_rect)),
     createdAt: normalizeTimestamp(value.createdAt, timestamp),
     updatedAt: normalizeTimestamp(value.updatedAt, timestamp),
@@ -334,8 +337,12 @@ function normalizePositiveNumber(value) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }
 
-const OUTFIT_STATUSES = new Set(['worn', 'planned']);
-const OUTFIT_SOURCES = new Set(['ai', 'local', 'shuffle', 'manual']);
+export const UNAVAILABLE_REASONS = new Set(['laundry', 'cleaning', 'repair', 'away']);
+
+// "loved" and "rejected" are feedback on a suggestion rather than a day's
+// outfit: they never count as wear, and only shape what gets suggested next.
+const OUTFIT_STATUSES = new Set(['worn', 'planned', 'loved', 'rejected']);
+const OUTFIT_SOURCES = new Set(['ai', 'local', 'shuffle', 'manual', 'photo', 'week', 'trip']);
 
 /**
  * Produces the canonical outfit-record shape stored in IndexedDB: a date plus

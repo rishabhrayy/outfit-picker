@@ -210,6 +210,10 @@ function statusMessage(status, detail, provider) {
   // setup instructions ("GEMINI_API_KEY is not set"), not a passing blip.
   if (provider.presetId === BUILTIN_PRESET_ID) {
     if (status === 401) return 'Wrong passcode for the built-in AI. Check it in Settings.';
+    // Seen live, on both models at once: Gemini's free tier is sometimes just busy.
+    if (status === 503 && /high demand|overloaded|unavailable/i.test(String(detail))) {
+      return 'Google\'s AI is busy right now. Wait a minute and try again.';
+    }
     if (status >= 500 && detail) return detail;
   }
   if (status === 401 || status === 403) {
@@ -564,6 +568,25 @@ export async function tagPhoto(file, { provider, signal } = {}) {
   return { items: fallback.items, model: fallbackModel, usedFallback: true, jsonMode: fallback.jsonMode };
 }
 
+/**
+ * Runs `attempt` on the main model, then once on the fallback model if the
+ * first failed. Gemini answers 503 "high demand" often enough (seen twice in
+ * three live calls) that one overloaded model shouldn't end a request. Only an
+ * error the provider actually answered with is retried: a rejected key or
+ * passcode fails the same way on any model, and retrying a timeout or a lost
+ * connection would just make someone wait twice as long to see it fail.
+ */
+async function withFallbackModel(provider, attempt) {
+  try {
+    return await attempt(provider.model);
+  } catch (error) {
+    const fallbackModel = provider.fallbackModel;
+    const retryable = typeof error?.status === 'number' && error.status !== 401 && error.status !== 403;
+    if (!retryable || !fallbackModel || fallbackModel === provider.model) throw error;
+    return attempt(fallbackModel);
+  }
+}
+
 function describeCandidate(item) {
   const parts = [
     `id: ${item.id}`,
@@ -592,6 +615,7 @@ export async function suggestOutfit({
   excludedItemIds = [],
   avoidRecentDays = 7,
   today,
+  feedback = {},
   provider,
   signal,
 } = {}) {
@@ -605,9 +629,18 @@ export async function suggestOutfit({
     ? candidates.find((item) => item.id === preferences.wantedItemId)
     : null;
 
+  const known = new Set(candidates.map((item) => item.id));
+  const blockedPairs = (feedback.blockedPairs || [])
+    .filter(([a, b]) => known.has(a) && known.has(b));
+  const lovedOutfits = (feedback.lovedOutfits || [])
+    .map((ids) => ids.filter((id) => known.has(id)))
+    .filter((ids) => ids.length > 1)
+    .slice(0, 5);
+
   const request = [
     `Occasion: ${preferences.occasion || 'Everyday'}`,
     `Weather: ${preferences.weather || 'mild'}, around ${preferences.temperature ?? 20} degrees Celsius`,
+    preferences.forecastNote || '',
     `Desired vibe: ${preferences.vibe || 'Easy'}`,
     today ? `Today: ${today}` : '',
     `Strongly prefer pieces not worn in the last ${avoidRecentDays} days.`,
@@ -617,6 +650,12 @@ export async function suggestOutfit({
     excludedItemIds.length
       ? `These ids were already suggested and must not be used again: ${excludedItemIds.join(', ')}`
       : '',
+    blockedPairs.length
+      ? `The wearer said never to suggest these pairings again. Never put both items of a pair in the outfit: ${blockedPairs.map(([a, b]) => `${a} with ${b}`).join('; ')}`
+      : '',
+    lovedOutfits.length
+      ? `Outfits the wearer loved, as a guide to their taste (don't just repeat one): ${lovedOutfits.map((ids) => `[${ids.join(', ')}]`).join('; ')}`
+      : '',
     '',
     'Wardrobe available right now:',
     candidates.map(describeCandidate).join('\n'),
@@ -624,7 +663,7 @@ export async function suggestOutfit({
     .filter(Boolean)
     .join('\n');
 
-  const attempt = (model) => callChatJson({
+  const { data, jsonMode } = await withFallbackModel(provider, (model) => callChatJson({
     provider,
     model,
     maxTokens: provider.outfitMaxTokens,
@@ -634,26 +673,8 @@ export async function suggestOutfit({
       { role: 'system', content: OUTFIT_SYSTEM_PROMPT },
       { role: 'user', content: request },
     ],
-  });
+  }));
 
-  let result;
-  try {
-    result = await attempt(provider.model);
-  } catch (error) {
-    // One retry on the fallback model, as tagging does. Gemini answers 503
-    // "high demand" often enough (seen twice in three live calls) that a
-    // single overloaded model shouldn't end the request. Only an error the
-    // provider actually answered with is retried: a rejected key or passcode
-    // would fail the same way on any model, and retrying a timeout or a lost
-    // connection would just make someone wait twice as long to see it fail.
-    const fallbackModel = provider.fallbackModel;
-    const retryable = typeof error?.status === 'number' && error.status !== 401 && error.status !== 403;
-    if (!retryable || !fallbackModel || fallbackModel === provider.model) throw error;
-    result = await attempt(fallbackModel);
-  }
-  const { data, jsonMode } = result;
-
-  const known = new Set(candidates.map((item) => item.id));
   const itemIds = [...new Set(Array.isArray(data?.itemIds) ? data.itemIds : [])]
     .filter((id) => known.has(id));
 
@@ -661,10 +682,222 @@ export async function suggestOutfit({
     throw new Error('No wearable combination came back. Try adjusting your answers.');
   }
 
+  // Told not to, a model can still slip; a ruled-out pairing is never shown.
+  const chosen = new Set(itemIds);
+  if (blockedPairs.some(([a, b]) => chosen.has(a) && chosen.has(b))) {
+    throw new Error('The AI picked a pairing you ruled out, so here is a pick without it.');
+  }
+
   return {
     itemIds,
     explanation: String(data?.explanation || '').trim() || 'This combination is ready to wear.',
     jsonMode,
+  };
+}
+
+const OUTFIT_PHOTO_SYSTEM_PROMPT = [
+  'You are looking at one photo of a person wearing today\'s outfit, usually a mirror selfie,',
+  'together with a list of the clothes they own. Do two things.',
+  '',
+  '1. wearing: list every garment and accessory you can actually see them wearing, once each.',
+  '   For each, give the id of the wardrobe item it is, or an empty string if nothing in the list',
+  '   is a convincing match. Match on category first, then colour, then the notes. When two',
+  '   items could both be it, pick the closer one; when none really fits, use an empty string.',
+  '   Never use an id that is not in the list. Ignore the room, the phone and the mirror.',
+  '',
+  '2. Give honest, specific feedback, as a friend with a good eye would, for the occasion and',
+  '   weather given. No score, rating or percentage. verdict: one plain sentence on how it',
+  '   works overall. working: one to three specific things that work. tweaks: zero to three',
+  '   specific, doable changes; when a piece from their wardrobe would be a better choice,',
+  '   name it in swapItemId (otherwise an empty string). If the outfit works, say so and keep',
+  '   tweaks empty rather than inventing problems. Only comment on what is visible.',
+].join('\n');
+
+const OUTFIT_PHOTO_SCHEMA = {
+  name: 'outfit_photo',
+  strict: true,
+  schema: {
+    type: 'object',
+    properties: {
+      wearing: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            category: { type: 'string', enum: CATEGORY_ENUM },
+            description: { type: 'string' },
+            itemId: { type: 'string', description: 'A wardrobe id, or an empty string if none matches.' },
+          },
+          required: ['category', 'description', 'itemId'],
+          additionalProperties: false,
+        },
+      },
+      verdict: { type: 'string' },
+      working: { type: 'array', items: { type: 'string' } },
+      tweaks: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            suggestion: { type: 'string' },
+            swapItemId: { type: 'string', description: 'A wardrobe id to wear instead, or an empty string.' },
+          },
+          required: ['suggestion', 'swapItemId'],
+          additionalProperties: false,
+        },
+      },
+    },
+    required: ['wearing', 'verdict', 'working', 'tweaks'],
+    additionalProperties: false,
+  },
+};
+
+/**
+ * Reads a photo of today's outfit: which saved pieces are being worn (so the
+ * day can be logged in one step), plus honest written feedback. One call does
+ * both, since the model is looking at the same picture either way.
+ */
+export async function analyzeOutfitPhoto(file, { provider, wardrobe = [], occasion = 'Everyday', forecastNote = '', signal } = {}) {
+  requireProvider(provider);
+  const { dataUrl } = await prepareImage(file);
+  const known = new Set(wardrobe.map((item) => item.id));
+
+  const context = [
+    `Occasion: ${occasion}`,
+    forecastNote,
+    '',
+    wardrobe.length ? 'Their wardrobe:' : 'Their wardrobe is empty, so every itemId and swapItemId is an empty string.',
+    wardrobe.map(describeCandidate).join('\n'),
+  ].filter((line) => line !== null && line !== undefined).join('\n');
+
+  const { data } = await withFallbackModel(provider, (model) => callChatJson({
+    provider,
+    model,
+    maxTokens: provider.taggingMaxTokens,
+    schema: OUTFIT_PHOTO_SCHEMA,
+    signal,
+    messages: [
+      { role: 'system', content: OUTFIT_PHOTO_SYSTEM_PROMPT },
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: context },
+          { type: 'image_url', image_url: { url: dataUrl, detail: 'high' } },
+        ],
+      },
+    ],
+  }));
+
+  const validId = (id) => (typeof id === 'string' && known.has(id) ? id : '');
+  const text = (value, max = 300) => String(value || '').trim().slice(0, max);
+  const seen = new Set();
+
+  const wearing = (Array.isArray(data?.wearing) ? data.wearing : [])
+    .map((entry) => ({
+      category: CATEGORY_ENUM.includes(entry?.category) ? entry.category : 'accessory',
+      description: text(entry?.description, 120),
+      itemId: validId(entry?.itemId),
+    }))
+    // The same saved piece can't be worn twice; keep its first, likeliest match.
+    .map((entry) => {
+      if (!entry.itemId) return entry;
+      if (seen.has(entry.itemId)) return { ...entry, itemId: '' };
+      seen.add(entry.itemId);
+      return entry;
+    });
+
+  return {
+    wearing,
+    verdict: text(data?.verdict),
+    working: (Array.isArray(data?.working) ? data.working : []).map((line) => text(line)).filter(Boolean).slice(0, 3),
+    tweaks: (Array.isArray(data?.tweaks) ? data.tweaks : [])
+      .map((tweak) => ({ suggestion: text(tweak?.suggestion), swapItemId: validId(tweak?.swapItemId) }))
+      .filter((tweak) => tweak.suggestion)
+      .slice(0, 3),
+  };
+}
+
+const CAPSULE_SYSTEM_PROMPT = [
+  'You are building a capsule wardrobe from clothes a person already owns: a small set of',
+  'pieces that mix and match into as many complete outfits as possible.',
+  '',
+  'Choose the requested number of pieces from the list, using only ids from the list. A',
+  'complete outfit is a top, a bottom and shoes, or a dress and shoes, optionally with a layer.',
+  'Favour pieces that go with many others (neutral or complementary colours, versatile',
+  'styles), include at least one pair of shoes, and fit the season given. Avoid pieces that',
+  'only go with one other piece.',
+  '',
+  'Then list four to eight example outfits made only from the chosen pieces. The explanation',
+  'is two or three plain sentences on why these pieces work together. No bullet points.',
+].join('\n');
+
+const CAPSULE_SCHEMA = {
+  name: 'capsule_wardrobe',
+  strict: true,
+  schema: {
+    type: 'object',
+    properties: {
+      itemIds: { type: 'array', items: { type: 'string' } },
+      outfits: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: { itemIds: { type: 'array', items: { type: 'string' } } },
+          required: ['itemIds'],
+          additionalProperties: false,
+        },
+      },
+      explanation: { type: 'string' },
+    },
+    required: ['itemIds', 'outfits', 'explanation'],
+    additionalProperties: false,
+  },
+};
+
+/**
+ * Picks a capsule of `size` owned pieces that combine into the most outfits,
+ * with example outfits made only from those pieces. Text only; no photos.
+ */
+export async function buildCapsule({ provider, wardrobe = [], size = 12, season = '', signal } = {}) {
+  requireProvider(provider);
+  if (wardrobe.length < 4) {
+    throw new Error('Add a few more pieces first. A capsule needs at least a top, a bottom and shoes to choose from.');
+  }
+  const known = new Set(wardrobe.map((item) => item.id));
+
+  const request = [
+    `Number of pieces: ${Math.min(size, wardrobe.length)}`,
+    season ? `Season: ${season}` : 'Season: any; favour year-round pieces.',
+    '',
+    'Wardrobe:',
+    wardrobe.map(describeCandidate).join('\n'),
+  ].join('\n');
+
+  const { data } = await withFallbackModel(provider, (model) => callChatJson({
+    provider,
+    model,
+    maxTokens: provider.taggingMaxTokens,
+    schema: CAPSULE_SCHEMA,
+    signal,
+    messages: [
+      { role: 'system', content: CAPSULE_SYSTEM_PROMPT },
+      { role: 'user', content: request },
+    ],
+  }));
+
+  const itemIds = [...new Set((Array.isArray(data?.itemIds) ? data.itemIds : []).filter((id) => known.has(id)))];
+  if (!itemIds.length) throw new Error('No capsule came back. Try again.');
+  const inCapsule = new Set(itemIds);
+
+  const outfits = (Array.isArray(data?.outfits) ? data.outfits : [])
+    // An example outfit may only use capsule pieces; anything else is dropped.
+    .map((outfit) => [...new Set((Array.isArray(outfit?.itemIds) ? outfit.itemIds : []).filter((id) => inCapsule.has(id)))])
+    .filter((ids) => ids.length >= 2);
+
+  return {
+    itemIds,
+    outfits,
+    explanation: String(data?.explanation || '').trim().slice(0, 600),
   };
 }
 

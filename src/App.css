@@ -210,7 +210,7 @@ button { -webkit-tap-highlight-color: transparent; }
 .question-block legend { margin-bottom: 11px; font-size: 14px; font-weight: 760; }
 .choice-grid { display: grid; gap: 8px; }
 .occasion-grid { grid-template-columns: repeat(3, 1fr); }
-.weather-grid { grid-template-columns: repeat(4, 1fr); }
+.weather-grid { grid-template-columns: repeat(5, 1fr); }
 .choice-button { border: 1px solid var(--line); background: #fcfaf6; min-height: 48px; border-radius: 12px; padding: 7px 6px; color: #615b55; font-size: 12px; transition: all .16s ease; }
 .choice-button small { display: block; color: #9c958d; margin-top: 2px; font-size: 10px; }
 .choice-button.is-selected { color: var(--ink); border-color: var(--ink); background: var(--lime); box-shadow: 0 2px 0 var(--ink); }
@@ -316,7 +316,7 @@ button { -webkit-tap-highlight-color: transparent; }
 @keyframes toast-in { from { opacity: 0; transform: translate(-50%, 9px); } to { opacity: 1; transform: translate(-50%, 0); } }
 
 /* Journal: the segment toggle, the history/planning list, and the stats panel. */
-.segment-toggle { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 18px; background: var(--canvas); border: 1px solid var(--line); border-radius: 14px; padding: 4px; }
+.segment-toggle { display: grid; grid-template-columns: repeat(auto-fit, minmax(0, 1fr)); gap: 8px; margin-bottom: 18px; background: var(--canvas); border: 1px solid var(--line); border-radius: 14px; padding: 4px; }
 .segment-button { border: 0; background: none; border-radius: 11px; padding: 10px; font-size: 12px; font-weight: 750; color: var(--muted); cursor: pointer; }
 .segment-button.is-selected { background: white; color: var(--ink); box-shadow: 0 2px 6px rgba(37,35,33,.08); }
 
@@ -365,10 +365,85 @@ button { -webkit-tap-highlight-color: transparent; }
   .app-header { padding-left: 16px; padding-right: 16px; }
   .filter-scroll { margin-left: -16px; margin-right: -16px; padding-left: 16px; }
   .wardrobe-photo { height: 170px; }
-  .weather-grid { grid-template-columns: repeat(2, 1fr); }
+  .weather-grid { grid-template-columns: repeat(3, 1fr); }
   .review-actions { margin-right: -16px; }
 }
 
 .backup-actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; margin-top: 16px; }
 .backup-actions .secondary-button { position: relative; display: inline-flex; align-items: center; justify-content: center; text-align: center; }
 .backup-actions label.secondary-button:focus-within { outline: 3px solid #7fa5ff; outline-offset: 2px; }
+
+/* Out of rotation: dimmed in the grid, with its reason where the worn date goes. */
+.wardrobe-card.is-unavailable .wardrobe-photo { opacity: .45; filter: grayscale(.6); }
+.unavailable-badge { background: var(--coral); color: var(--ink); }
+.select-all { margin: -4px 0 10px; }
+
+/* Feedback on a suggestion. */
+.rating-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
+.rating-row .secondary-button { font-size: 12px; }
+.rating-row .is-loved { color: #a8324a; border-color: #e7b3bf; background: #fdf0f3; }
+.journal-badge-loved { background: #fdf0f3; color: #a8324a; }
+.ruled-out { margin-top: 18px; }
+
+/* Live weather. */
+.forecast-line { margin: 0 0 10px; font-size: 12px; color: #4d4559; background: var(--lavender); padding: 8px 11px; border-radius: 10px; }
+.photo-check-strip { width: 100%; margin-top: 18px; border: 1px dashed #cfc6ba; background: #fffdf9; color: var(--ink); padding: 13px 14px; border-radius: 16px; display: flex; align-items: center; gap: 12px; text-align: left; cursor: pointer; }
+.photo-check-strip > span:first-child { font-size: 20px; color: #795da3; }
+.photo-check-strip span:nth-child(2) { display: grid; gap: 2px; flex: 1; }
+.photo-check-strip strong { font-size: 14px; }
+.photo-check-strip small { color: var(--muted); font-size: 12px; }
+.photo-check-strip .arrow { color: var(--muted); }
+
+.place-search { display: flex; gap: 8px; margin-bottom: 10px; }
+.place-search input { flex: 1; min-width: 0; font-size: 16px; color: var(--ink); padding: 9px 10px; border: 1px solid var(--line); border-radius: 10px; background: #fffdf9; }
+.place-results { display: grid; gap: 6px; margin-bottom: 10px; }
+.place-option { text-align: left; border: 1px solid var(--line); background: var(--canvas); border-radius: 10px; padding: 9px 11px; font-size: 13px; color: var(--ink); cursor: pointer; }
+
+/* Plan ahead. */
+.planner-stack { display: grid; gap: 4px; }
+.planner-card .form-grid { margin-bottom: 10px; }
+.planner-card .primary-button { margin-top: 6px; }
+.planner-card > .text-button { display: block; margin: 10px auto 0; }
+.compact-block { margin: 0 0 8px; }
+.compact-block legend { font-size: 11px; }
+.plan-list { display: grid; gap: 8px; margin: 12px 0; }
+.plan-day { display: flex; align-items: center; gap: 12px; padding: 9px 11px; border: 1px solid var(--line); border-radius: 13px; background: var(--canvas); }
+.plan-day-label { display: grid; gap: 2px; width: 92px; flex-shrink: 0; }
+.plan-day-label strong { font-size: 12px; }
+.plan-day-label small { font-size: 10px; color: var(--muted); }
+.plan-day .journal-row-photos { flex: 1; min-width: 0; overflow: hidden; }
+.plan-empty { flex: 1; color: var(--muted); font-size: 11px; }
+.plan-summary { font-size: 13px; line-height: 1.45; margin: 0 0 12px; }
+.packing-list { list-style: none; margin: 0 0 6px; padding: 0; display: grid; gap: 6px; }
+.packing-list label { display: flex; align-items: center; gap: 10px; padding: 7px 10px; border: 1px solid var(--line); border-radius: 12px; font-size: 12px; cursor: pointer; }
+.packing-list input { width: 18px; height: 18px; accent-color: var(--lime-deep); flex-shrink: 0; }
+.packing-photo { width: 34px; height: 42px; border-radius: 7px; flex-shrink: 0; }
+.packing-photo.photo-placeholder span { font-size: 18px; }
+.capsule-result { margin-top: 14px; display: grid; gap: 12px; }
+.capsule-result h3 { font-size: 12px; font-weight: 800; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); margin: 0; }
+.capsule-result > .journal-row-photos { flex-wrap: wrap; gap: 6px; }
+.capsule-photo { width: 52px; height: 66px; border-radius: 9px; }
+.capsule-photo.photo-placeholder span { font-size: 22px; }
+.plan-day .journal-photo.photo-placeholder span, .journal-photo.photo-placeholder span { font-size: 18px; }
+
+/* Today's outfit photo. */
+.photo-check-pick { width: 100%; display: grid; justify-items: center; gap: 6px; padding: 30px 16px; margin-bottom: 14px; border: 1.5px dashed #cfc6ba; border-radius: 16px; background: var(--canvas); color: var(--ink); cursor: pointer; text-align: center; }
+.photo-check-pick > span { font-size: 30px; color: #795da3; }
+.photo-check-pick small { color: var(--muted); font-size: 12px; max-width: 260px; }
+.photo-check-preview { display: block; width: 100%; max-height: 300px; object-fit: contain; border-radius: 16px; background: #ece8e1; margin-bottom: 14px; }
+.photo-check .wanted-select { margin: 0 0 12px; }
+.photo-check > .text-button { display: block; margin: 10px auto 0; }
+.feedback-section { margin-bottom: 14px; }
+.feedback-section h3 { font-size: 12px; font-weight: 800; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); margin: 0 0 8px; }
+.feedback-section ul { margin: 0; padding-left: 18px; display: grid; gap: 6px; font-size: 13px; line-height: 1.45; }
+.feedback-section li.has-swap { display: grid; gap: 6px; }
+.swap-chip { display: inline-flex; align-items: center; gap: 8px; justify-self: start; padding: 4px 10px 4px 4px; border: 1px solid var(--line); border-radius: 999px; font-size: 11px; color: var(--muted); background: white; }
+.swap-photo { width: 26px; height: 26px; border-radius: 50%; }
+.swap-photo.photo-placeholder span { font-size: 12px; }
+.match-list { list-style: none; padding: 0 !important; }
+.match-list li { display: flex; align-items: center; gap: 10px; }
+.match-photo { width: 44px; height: 56px; border-radius: 9px; flex-shrink: 0; }
+.match-photo.photo-placeholder span { font-size: 20px; }
+.match-list label { flex: 1; min-width: 0; display: grid; gap: 4px; }
+.match-list small { color: var(--muted); font-size: 11px; }
+.match-list select { width: 100%; min-height: 38px; border: 1px solid #ddd6cd; border-radius: 10px; padding: 7px 9px; background: #fffdf9; color: var(--ink); font-size: 13px; }
