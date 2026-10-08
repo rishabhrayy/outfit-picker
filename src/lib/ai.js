@@ -25,6 +25,7 @@
 
 import { BUILTIN_PRESET_ID, detectKeyMismatch, getPreset } from './providers.js';
 import { normalizeDetectedItem } from '../types.js';
+import { cropFromBox } from './crop.js';
 import { prepareImage } from './image.js';
 
 // Vision calls on a reasoning model routinely take 7-10s; this is the point at
@@ -74,6 +75,10 @@ const TAGGING_SYSTEM_PROMPT = [
   '  sporty, streetwear, relaxed, minimal, party).',
   '- seasons and weather: use "all-season" when a piece genuinely works year round.',
   '- description: a short phrase naming the garment, such as "ribbed knit crew-neck jumper".',
+  '- box: where the item is in the photo, as [yMin, xMin, yMax, xMax], each from 0 to 1000',
+  '  (0,0 is the top-left corner). Make it tight around the visible part of that one item:',
+  '  the jumper, not the whole person. In a mirror photo, box the item as it appears in the',
+  '  mirror, once; never the phone, the mirror frame, or the same item seen twice.',
   '',
   'If the photo contains no wearable item at all, return an empty items array.',
 ].join('\n');
@@ -96,8 +101,13 @@ const TAGGING_SCHEMA = {
             styleTags: { type: 'array', items: { type: 'string' } },
             seasons: { type: 'array', items: { type: 'string', enum: SEASON_ENUM } },
             weather: { type: 'array', items: { type: 'string', enum: WEATHER_ENUM } },
+            box: {
+              type: 'array',
+              description: 'Where the item is: [yMin, xMin, yMax, xMax], each 0-1000.',
+              items: { type: 'integer' },
+            },
           },
-          required: ['category', 'description', 'colors', 'styleTags', 'seasons', 'weather'],
+          required: ['category', 'description', 'colors', 'styleTags', 'seasons', 'weather', 'box'],
           additionalProperties: false,
         },
       },
@@ -354,8 +364,17 @@ function withJsonInstructions(messages, schemaWrapper) {
   ));
 }
 
-function buildRequestBody(mode, model, messages, schemaWrapper, maxTokens) {
+/**
+ * Read from the preset rather than the saved provider record, so providers
+ * added before this setting existed get it too.
+ */
+function reasoningEffortFor(provider) {
+  return provider?.presetId ? getPreset(provider.presetId).reasoningEffort || '' : '';
+}
+
+function buildRequestBody(mode, model, messages, schemaWrapper, maxTokens, reasoningEffort = '') {
   const base = { model, temperature: 0.2, max_tokens: maxTokens };
+  if (reasoningEffort) base.reasoning_effort = reasoningEffort;
 
   if (mode === 'schema') {
     return { ...base, messages, response_format: { type: 'json_schema', json_schema: schemaWrapper } };
@@ -456,7 +475,7 @@ async function callChatJson({ provider, model, messages, schema, maxTokens, sign
 
   for (let index = 0; index < modes.length; index += 1) {
     const mode = modes[index];
-    const body = buildRequestBody(mode, model, messages, schema, maxTokens);
+    const body = buildRequestBody(mode, model, messages, schema, maxTokens, reasoningEffortFor(provider));
 
     try {
       const { content, toolArguments } = await requestOnce({ provider, body, signal });
@@ -512,6 +531,10 @@ function toReviewItem(raw) {
     styleTags: detected.styleTags,
     seasons: [...detected.seasons, ...detected.weatherSuitability],
     notes: typeof raw?.description === 'string' ? raw.description.trim().slice(0, 200) : '',
+    // Each item from a multi-item photo starts cropped to just itself. A
+    // missing or nonsense box leaves the full photo, which can still be
+    // cropped by hand.
+    crop: cropFromBox(raw?.box),
   };
 }
 
@@ -693,6 +716,67 @@ export async function suggestOutfit({
     explanation: String(data?.explanation || '').trim() || 'This combination is ready to wear.',
     jsonMode,
   };
+}
+
+const LOCATE_SCHEMA = {
+  name: 'item_location',
+  strict: true,
+  schema: {
+    type: 'object',
+    properties: {
+      found: { type: 'boolean' },
+      box: {
+        type: 'array',
+        description: 'Where the item is: [yMin, xMin, yMax, xMax], each 0-1000. Empty if not found.',
+        items: { type: 'integer' },
+      },
+    },
+    required: ['found', 'box'],
+    additionalProperties: false,
+  },
+};
+
+/**
+ * Finds one already-catalogued garment in its source photo and returns a crop
+ * for it, or null if it isn't there. For items saved before tagging returned
+ * positions: a full-outfit photo's pieces all showed the whole photo.
+ */
+export async function locateItem(file, { provider, item, signal } = {}) {
+  requireProvider(provider);
+  const { dataUrl } = await prepareImage(file);
+  const description = [
+    item?.notes,
+    item?.colors?.length ? `colours: ${item.colors.join(', ')}` : '',
+    `category: ${item?.category || 'garment'}`,
+  ].filter(Boolean).join('; ');
+
+  const { data } = await withFallbackModel(provider, (model) => callChatJson({
+    provider,
+    model,
+    maxTokens: provider.outfitMaxTokens,
+    schema: LOCATE_SCHEMA,
+    signal,
+    messages: [
+      {
+        role: 'system',
+        content: [
+          'Find one specific clothing item in a photo and say where it is.',
+          'box is [yMin, xMin, yMax, xMax], each from 0 to 1000, with 0,0 the top-left corner, tight',
+          'around the visible part of that item only. In a mirror photo, use the item as it appears',
+          'in the mirror. If the item is not in the photo, set found to false and box to [].',
+        ].join('\n'),
+      },
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: `The item: ${description}` },
+          { type: 'image_url', image_url: { url: dataUrl, detail: 'high' } },
+        ],
+      },
+    ],
+  }));
+
+  return data?.found ? cropFromBox(data.box) : null;
 }
 
 const OUTFIT_PHOTO_SYSTEM_PROMPT = [
@@ -924,7 +1008,7 @@ export async function testProvider(provider, { withVision = false } = {}) {
 
     const { content } = await requestOnce({
       provider,
-      body: { model: provider.model, messages, max_tokens: 20, temperature: 0 },
+      body: { model: provider.model, messages, max_tokens: 20, temperature: 0, ...(reasoningEffortFor(provider) && { reasoning_effort: reasoningEffortFor(provider) }) },
     });
 
     return {

@@ -6,7 +6,7 @@ vi.mock('../src/lib/image.js', () => ({
   prepareImage: vi.fn(async () => ({ dataUrl: 'data:image/jpeg;base64,PHOTOBYTES' })),
 }));
 
-import { analyzeOutfitPhoto, buildCapsule, suggestOutfit, tagPhoto, testProvider } from '../src/lib/ai.js';
+import { analyzeOutfitPhoto, buildCapsule, locateItem, suggestOutfit, tagPhoto, testProvider } from '../src/lib/ai.js';
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -705,5 +705,56 @@ describe('buildCapsule', () => {
     const calls = stubFetch(asJson({}));
     await expect(buildCapsule({ provider: makeProvider(), wardrobe: wardrobe.slice(0, 2) })).rejects.toThrow('Add a few more pieces');
     expect(calls).toHaveLength(0);
+  });
+});
+
+describe('finding each piece in a mirror photo', () => {
+  it('asks for a box per item, and gives each item its own crop', async () => {
+    const calls = stubFetch(asJson({
+      items: [
+        { ...TOP, box: [180, 300, 520, 700] },
+        { ...SHOES, box: [880, 320, 980, 680] },
+        { ...TOP, category: 'bottom', description: 'jeans', box: [] },
+      ],
+    }));
+    const { items } = await tagPhoto(PHOTO, { provider: makeProvider() });
+
+    const schema = calls[0].body.response_format.json_schema.schema.properties.items.items;
+    expect(schema.required).toContain('box');
+    expect(calls[0].body.messages[0].content).toContain('mirror');
+
+    expect(items[0].crop).toMatchObject({ unit: 'percent' });
+    expect(items[0].crop.y).toBeLessThan(18);
+    expect(items[1].crop.y).toBeGreaterThan(80);
+    // A box it couldn't give leaves the full photo, croppable by hand.
+    expect(items[2].crop).toBeNull();
+  });
+
+  it('locates an already-saved piece and returns a crop, or null if it is not there', async () => {
+    const calls = stubFetch(asJson({ found: true, box: [100, 200, 500, 800] }));
+    const crop = await locateItem(PHOTO, { provider: makeProvider(), item: { category: 'top', colors: ['navy'], notes: 'navy crew-neck tee' } });
+    expect(crop).toMatchObject({ unit: 'percent' });
+    expect(calls[0].body.messages[1].content[0].text).toContain('navy crew-neck tee');
+
+    stubFetch(asJson({ found: false, box: [] }));
+    expect(await locateItem(PHOTO, { provider: makeProvider(), item: { category: 'shoes' } })).toBeNull();
+  });
+});
+
+describe('Gemini reasoning effort', () => {
+  it('asks Gemini and the built-in AI to think less, which took tagging from 53s to under 3s', async () => {
+    for (const presetId of ['gemini', 'builtin']) {
+      const calls = stubFetch(asJson(PICK));
+      await outfitCall(makeProvider({ presetId }));
+      expect(calls[0].body.reasoning_effort).toBe('low');
+    }
+  });
+
+  it('never sends it to OpenAI or a Custom provider, which can reject it', async () => {
+    for (const presetId of ['openai', 'custom', 'anthropic']) {
+      const calls = stubFetch(asJson(PICK));
+      await outfitCall(makeProvider({ presetId }));
+      expect(calls[0].body).not.toHaveProperty('reasoning_effort');
+    }
   });
 });

@@ -219,6 +219,27 @@ export function setRepeatDays(value) {
   return writeStorage(REPEAT_DAYS_STORAGE_KEY, String(safe));
 }
 
+const OUTFIT_PREFERENCES_STORAGE_KEY = 'outfit-picker-outfit-preferences';
+const KNOWN_OCCASIONS = ['Everyday', 'Work', 'Dinner', 'Date night', 'Event', 'Active'];
+const KNOWN_VIBES = ['Easy', 'Polished', 'Playful', 'Minimal', 'Sporty', 'Bold'];
+
+/** The occasion and vibe last asked for on the Today screen. */
+export function getOutfitPreferences() {
+  try {
+    const parsed = JSON.parse(readStorage(OUTFIT_PREFERENCES_STORAGE_KEY) || '{}');
+    return {
+      occasion: KNOWN_OCCASIONS.includes(parsed.occasion) ? parsed.occasion : 'Everyday',
+      vibe: KNOWN_VIBES.includes(parsed.vibe) ? parsed.vibe : 'Easy',
+    };
+  } catch {
+    return { occasion: 'Everyday', vibe: 'Easy' };
+  }
+}
+
+export function setOutfitPreferences({ occasion, vibe }) {
+  return writeStorage(OUTFIT_PREFERENCES_STORAGE_KEY, JSON.stringify({ occasion, vibe }));
+}
+
 /**
  * Where live weather is fetched for, or null when live weather is off (the
  * default). Coordinates are rounded to one decimal place, about 10 km, so even

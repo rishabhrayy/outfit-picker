@@ -37,6 +37,8 @@ export const PROVIDER_PRESETS = Object.freeze([
     keyHost: '',
     keyPrefixes: [],
     jsonMode: 'schema',
+    // See the Gemini preset below.
+    reasoningEffort: 'low',
   }),
   Object.freeze({
     id: 'anthropic',
@@ -102,6 +104,11 @@ export const PROVIDER_PRESETS = Object.freeze([
     keyHost: 'aistudio.google.com/apikey',
     keyPrefixes: ['AIza', 'AQ.'],
     jsonMode: 'schema',
+    // Gemini 3.x thinks before answering by default, and on a photo that can
+    // take most of a minute: one tagging request took 53s at the default and
+    // 2.7s at "low", with the same items and boxes. Sent only to Gemini, since
+    // OpenAI rejects this field on models that don't reason.
+    reasoningEffort: 'low',
   }),
   Object.freeze({
     id: 'groq',

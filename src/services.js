@@ -25,6 +25,7 @@ import { prepareImage } from './lib/image.js';
 import {
   analyzeOutfitPhoto as requestOutfitPhotoAnalysis,
   buildCapsule as requestCapsule,
+  locateItem as requestItemLocation,
   suggestOutfit as requestOutfit,
   tagPhoto as requestTags,
 } from './lib/ai.js';
@@ -313,6 +314,12 @@ export async function analyzeOutfitPhoto(file, { items = [], occasion, forecastN
   });
 }
 
+/** A crop for an item found in its own source photo, or null if it isn't there. */
+export async function locateItem(item) {
+  if (!item?.photo) throw new Error('This piece has no photo to search.');
+  return requestItemLocation(item.photo, { provider: getActiveProvider(), item });
+}
+
 export async function buildCapsule({ items = [], size, season }) {
   return requestCapsule({
     provider: getActiveProvider(),
@@ -342,6 +349,7 @@ export const services = {
   rateOutfit,
   analyzeOutfitPhoto,
   buildCapsule,
+  locateItem,
 };
 
 export default services;

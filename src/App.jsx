@@ -1,10 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Archive, CalendarDays, CalendarRange, Camera, CloudSun, Footprints, Gem, Heart, History,
+  Layers, LayoutGrid, Lock, Plane, Plus, RefreshCw, Settings, Shirt, Shuffle, Sparkles, X,
+} from 'lucide-react';
+import {
   MAX_ZOOM,
   MIN_ZOOM,
   controlsFromCrop,
   cropFromControls,
-  cropStyle,
+  coverLayout,
   spotlightStyle,
 } from './lib/crop.js';
 import {
@@ -43,11 +47,13 @@ import {
   addProvider,
   deleteProvider,
   getActiveProviderId,
+  getOutfitPreferences,
   getProviders,
   getRepeatDays,
   getWeatherLocation,
   hasAnyProvider,
   setActiveProviderId,
+  setOutfitPreferences,
   setRepeatDays,
   setWeatherLocation,
   updateProvider,
@@ -57,13 +63,38 @@ import './App.css';
 const EMPTY_SERVICES = {};
 const CATEGORIES = ['top', 'bottom', 'dress', 'outerwear', 'shoes', 'accessory'];
 const CATEGORY_META = {
-  top: { label: 'Tops', icon: '⌁' },
-  bottom: { label: 'Bottoms', icon: '⌄' },
-  dress: { label: 'Dresses', icon: '◒' },
-  outerwear: { label: 'Layers', icon: '◔' },
-  shoes: { label: 'Shoes', icon: '◌' },
-  accessory: { label: 'Extras', icon: '✦' },
+  top: { label: 'Tops', Icon: Shirt },
+  bottom: { label: 'Bottoms', Icon: TrousersIcon },
+  dress: { label: 'Dresses', Icon: DressIcon },
+  outerwear: { label: 'Layers', Icon: Layers },
+  shoes: { label: 'Shoes', Icon: Footprints },
+  accessory: { label: 'Extras', Icon: Gem },
 };
+
+// Lucide has no trousers or dress, so these two are drawn on its 24px grid
+// with the same 2px rounded strokes.
+function TrousersIcon(props) {
+  return (
+    <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...props}>
+      <path d="M7 3h10l1.5 18h-4.2L12 10l-2.3 11H5.5Z" />
+      <path d="M7 6.5h10" />
+    </svg>
+  );
+}
+
+function DressIcon(props) {
+  return (
+    <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...props}>
+      <path d="M9 3v3.5L7.5 10 4.5 21h15L16.5 10 15 6.5V3" />
+      <path d="M9 6.5c1 .8 2 1.2 3 1.2s2-.4 3-1.2" />
+    </svg>
+  );
+}
+
+function CategoryIcon({ category }) {
+  const Icon = CATEGORY_META[category]?.Icon || Shirt;
+  return <Icon className="category-icon" strokeWidth={1.5} aria-hidden="true" />;
+}
 const OCCASIONS = ['Everyday', 'Work', 'Dinner', 'Date night', 'Event', 'Active'];
 const VIBES = ['Easy', 'Polished', 'Playful', 'Minimal', 'Sporty', 'Bold'];
 const WEATHER_OPTIONS = [
@@ -244,13 +275,63 @@ function Photo({ item, blobUrls, className = '', alt = '' }) {
   if (!src) {
     return (
       <div className={`photo-placeholder ${className}`} aria-label={alt || 'No photo available'}>
-        <span>{CATEGORY_META[item.category]?.icon || '✦'}</span>
+        <CategoryIcon category={item.category} />
       </div>
     );
   }
+  return <CroppedImage src={src} crop={item.crop} alt={alt} className={className} />;
+}
+
+/**
+ * Draws just the cropped part of a photo, filling a frame of any shape. A crop
+ * can be any rectangle (tall for trousers, wide for shoes), so the layout is
+ * worked out from the photo's real size and the frame's real size rather than
+ * one CSS zoom. With no crop it's an ordinary cover-fit image.
+ */
+function CroppedImage({ src, crop, alt = '', className = '' }) {
+  const frameRef = useRef(null);
+  const imageRef = useRef(null);
+  const [frame, setFrame] = useState(null);
+  const [natural, setNatural] = useState(null);
+  const hasCrop = Boolean(crop && Number(crop.width) > 0 && Number(crop.width) < 99.5);
+
+  useEffect(() => {
+    if (!hasCrop || !frameRef.current) return undefined;
+    const element = frameRef.current;
+    const measure = () => setFrame({ width: element.clientWidth, height: element.clientHeight });
+    measure();
+    const observer = typeof ResizeObserver === 'function' ? new ResizeObserver(measure) : null;
+    observer?.observe(element);
+    return () => observer?.disconnect();
+  }, [hasCrop]);
+
+  // A cached image can finish loading before React attaches onLoad.
+  useEffect(() => {
+    const image = imageRef.current;
+    if (image?.complete && image.naturalWidth) setNatural({ width: image.naturalWidth, height: image.naturalHeight });
+  }, [src]);
+
+  const layout = hasCrop && frame && natural
+    ? coverLayout({ naturalWidth: natural.width, naturalHeight: natural.height, frameWidth: frame.width, frameHeight: frame.height, crop })
+    : null;
+
+  let style;
+  if (layout) {
+    style = { position: 'absolute', maxWidth: 'none', objectFit: 'fill', width: layout.width, height: layout.height, left: layout.left, top: layout.top };
+  } else if (hasCrop) {
+    // Hidden for the moment before it's measured, rather than flashing the whole photo.
+    style = { opacity: 0 };
+  }
+
   return (
-    <span className={`photo-frame ${className}`}>
-      <img src={src} alt={alt} style={cropStyle(item.crop)} />
+    <span className={`photo-frame ${className}`} ref={frameRef}>
+      <img
+        ref={imageRef}
+        src={src}
+        alt={alt}
+        style={style}
+        onLoad={(event) => setNatural({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })}
+      />
     </span>
   );
 }
@@ -271,7 +352,7 @@ function PhotoSpotlight({ item, blobUrls, className = '' }) {
   if (!src) {
     return (
       <div className={`photo-placeholder ${className}`} aria-label={alt}>
-        <span>{CATEGORY_META[item.category]?.icon || '✦'}</span>
+        <CategoryIcon category={item.category} />
       </div>
     );
   }
@@ -280,10 +361,15 @@ function PhotoSpotlight({ item, blobUrls, className = '' }) {
     return <Photo item={item} blobUrls={blobUrls} className={className} alt={alt} />;
   }
 
+  // The box is positioned in percent, so it sits on a wrapper exactly the
+  // image's size; letterboxing the image inside a fixed frame would put the
+  // highlight in the wrong place.
   return (
     <span className={`photo-spotlight ${className}`}>
-      <img src={src} alt={`${alt}, highlighted within the photo it was tagged from`} />
-      <span className="spotlight-box" style={box} />
+      <span className="spotlight-stage">
+        <img src={src} alt={`${alt}, highlighted within the photo it was tagged from`} />
+        <span className="spotlight-box" style={box} />
+      </span>
     </span>
   );
 }
@@ -362,9 +448,10 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
   // state flashes on every cold launch and tells a stocked wardrobe it is empty.
   const [isLoading, setIsLoading] = useState(() => Boolean(services.listItems));
   const [outfitRecords, setOutfitRecords] = useState([]);
-  const [activeTab, setActiveTab] = useState('wardrobe');
+  // Opens on Today: the outfit is the point, the wardrobe is how it gets there.
+  const [activeTab, setActiveTab] = useState('outfit');
   const [editingItem, setEditingItem] = useState(null);
-  const [toast, setToast] = useState('');
+  const [toast, setToastState] = useState(null);
   const [blobUrls, setBlobUrls] = useState({});
   // null | 'edit' | 'build' — the wardrobe grid's multi-select mode. Bulk-edit
   // and the manual outfit builder share this one mode rather than each having
@@ -448,11 +535,61 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
     return () => Object.values(created).forEach((url) => URL.revokeObjectURL(url));
   }, [items]);
 
+  /**
+   * Undo instead of "Are you sure?". A deleting action changes the screen at
+   * once and only really happens (commit) when its toast goes away, so Undo
+   * just puts things back. An action that's already saved instead passes an
+   * undo that reverses it. Either way only one undo is offered at a time: a
+   * newer toast commits the older one, and so does leaving the app.
+   */
+  const pendingUndoRef = useRef(null);
+
+  const flushPendingUndo = () => {
+    const pending = pendingUndoRef.current;
+    pendingUndoRef.current = null;
+    if (pending?.commit) {
+      Promise.resolve(pending.commit()).catch((error) => setToastState({ id: Date.now(), message: error?.message || 'That change could not be saved.' }));
+    }
+  };
+
+  const setToast = (message) => {
+    flushPendingUndo();
+    setToastState(message ? { id: Date.now(), message } : null);
+  };
+
+  const showUndo = (message, { commit, undo }) => {
+    flushPendingUndo();
+    const id = Date.now();
+    pendingUndoRef.current = { id, commit, undo };
+    setToastState({ id, message, undoable: true });
+  };
+
+  const undoLast = () => {
+    const pending = pendingUndoRef.current;
+    pendingUndoRef.current = null;
+    setToastState(null);
+    pending?.undo?.();
+  };
+
   useEffect(() => {
     if (!toast) return undefined;
-    const timeout = window.setTimeout(() => setToast(''), 3400);
+    const timeout = window.setTimeout(() => {
+      if (pendingUndoRef.current?.id === toast.id) flushPendingUndo();
+      setToastState(null);
+    }, toast.undoable ? 6000 : 3400);
     return () => window.clearTimeout(timeout);
   }, [toast]);
+
+  // Closing or backgrounding the app keeps whatever wasn't undone.
+  useEffect(() => {
+    const onHide = () => { if (document.visibilityState === 'hidden') flushPendingUndo(); };
+    document.addEventListener('visibilitychange', onHide);
+    window.addEventListener('pagehide', flushPendingUndo);
+    return () => {
+      document.removeEventListener('visibilitychange', onHide);
+      window.removeEventListener('pagehide', flushPendingUndo);
+    };
+  }, []);
 
   const updateItem = async (nextItem) => {
     const normalized = normalizeItem(nextItem);
@@ -467,16 +604,31 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
     }
   };
 
-  const deleteItem = async (id) => {
-    if (!window.confirm('Delete this wardrobe item? This cannot be undone.')) return;
-    try {
-      await services.deleteItem?.(id);
-      setItems((current) => current.filter((item) => item.id !== id));
-      setEditingItem(null);
-      setToast('Item deleted.');
-    } catch (error) {
-      setToast(error?.message || 'That item could not be deleted.');
-    }
+  /**
+   * Takes pieces off the screen now and deletes them for real once the Undo
+   * toast goes. Undo puts them back where they were in the list.
+   */
+  const removeItemsWithUndo = (ids, message) => {
+    const before = items;
+    const removed = before.filter((item) => ids.includes(item.id));
+    if (!removed.length) return;
+    setItems((current) => current.filter((item) => !ids.includes(item.id)));
+    showUndo(message, {
+      commit: async () => {
+        for (const id of ids) await services.deleteItem?.(id);
+      },
+      undo: () => setItems((current) => {
+        const byId = new Map(current.map((item) => [item.id, item]));
+        removed.forEach((item) => byId.set(item.id, item));
+        const added = current.filter((item) => !before.some((old) => old.id === item.id));
+        return [...added, ...before.filter((item) => byId.has(item.id)).map((item) => byId.get(item.id))];
+      }),
+    });
+  };
+
+  const deleteItem = (id) => {
+    setEditingItem(null);
+    removeItemsWithUndo([id], 'Item deleted.');
   };
 
   /**
@@ -534,15 +686,30 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
   };
 
   /**
-   * Marks a suggested (AI, local, or shuffled) outfit as worn today. Updates
-   * each item's lastWornDate exactly as before, and now also records the
-   * outfit itself so it shows up in the Journal.
+   * Marks an outfit as worn: each item's lastWornDate, plus one journal
+   * record. Saved straight away; Undo deletes the record and puts every
+   * piece's previous last-worn date back.
    */
-  const wearOutfit = async ({ itemIds, date, source, explanation }) => {
+  const wearOutfit = async ({ itemIds, date, source, explanation, message = 'Marked as worn today.', onUndone }) => {
     const wornDate = date || localDate();
+    const previous = new Map(items.filter((item) => itemIds.includes(item.id)).map((item) => [item.id, item.lastWornDate || '']));
     const record = await services.recordOutfitWorn?.({ itemIds, date: wornDate, source, explanation });
     setItems((current) => current.map((item) => (itemIds.includes(item.id) ? { ...item, lastWornDate: wornDate } : item)));
     if (record) setOutfitRecords((current) => [normalizeOutfitEntry(record), ...current]);
+
+    showUndo(message, {
+      undo: async () => {
+        try {
+          if (record) await services.deleteOutfitRecord?.(record.id);
+          await services.bulkUpdateItems?.(itemIds, (item) => ({ lastWornDate: previous.get(item.id) || '' }));
+          setItems((current) => current.map((item) => (previous.has(item.id) ? { ...item, lastWornDate: previous.get(item.id) } : item)));
+          if (record) setOutfitRecords((current) => current.filter((entry) => entry.id !== record.id));
+          onUndone?.();
+        } catch (error) {
+          setToast(error?.message || 'That couldn\'t be undone.');
+        }
+      },
+    });
   };
 
   /**
@@ -554,8 +721,7 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
   const saveLook = async ({ itemIds, date, occasion, explanation }) => {
     try {
       if (date === localDate()) {
-        await wearOutfit({ itemIds, date, source: 'manual', explanation });
-        setToast('Saved — marked as worn today.');
+        await wearOutfit({ itemIds, date, source: 'manual', explanation, message: 'Saved — marked as worn today.' });
       } else {
         const record = await services.planOutfit?.({ itemIds, date, occasion, explanation });
         if (record) setOutfitRecords((current) => [normalizeOutfitEntry(record), ...current]);
@@ -568,10 +734,22 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
     }
   };
 
-  /** "Love it" or "never suggest this again" on a suggestion. */
-  const rateOutfit = async ({ itemIds, rating, source, explanation }) => {
+  /** "Love it" or "never suggest this again" on a suggestion; Undo removes it. */
+  const rateOutfit = async ({ itemIds, rating, source, explanation, message, onUndone }) => {
     const record = await services.rateOutfit?.({ itemIds, rating, source, explanation });
-    if (record) setOutfitRecords((current) => [normalizeOutfitEntry(record), ...current]);
+    if (!record) return;
+    setOutfitRecords((current) => [normalizeOutfitEntry(record), ...current]);
+    showUndo(message || (rating === 'loved' ? 'Loved.' : 'Won\'t be suggested again.'), {
+      undo: async () => {
+        try {
+          await services.deleteOutfitRecord?.(record.id);
+          setOutfitRecords((current) => current.filter((entry) => entry.id !== record.id));
+          onUndone?.();
+        } catch (error) {
+          setToast(error?.message || 'That couldn\'t be undone.');
+        }
+      },
+    });
   };
 
   /** Saves a week plan or trip as planned outfits, one record per day. */
@@ -606,14 +784,20 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
     }
   };
 
-  const deleteOutfitEntry = async (id) => {
-    if (!window.confirm('Remove this outfit from your journal? This cannot be undone.')) return;
-    try {
-      await services.deleteOutfitRecord?.(id);
-      setOutfitRecords((current) => current.filter((record) => record.id !== id));
-    } catch (error) {
-      setToast(error?.message || 'That outfit could not be removed.');
-    }
+  const deleteOutfitEntry = (id) => {
+    const before = outfitRecords;
+    const removed = before.find((record) => record.id === id);
+    if (!removed) return;
+    setOutfitRecords((current) => current.filter((record) => record.id !== id));
+    showUndo('Removed from your journal.', {
+      commit: () => services.deleteOutfitRecord?.(id),
+      undo: () => setOutfitRecords((current) => {
+        const index = before.indexOf(removed);
+        const next = [...current];
+        next.splice(Math.min(index, next.length), 0, removed);
+        return next;
+      }),
+    });
   };
 
   /**
@@ -637,18 +821,9 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
     }
   };
 
-  const bulkDeleteWardrobe = async (ids) => {
-    if (!window.confirm(`Delete ${ids.length} selected ${ids.length === 1 ? 'item' : 'items'}? This cannot be undone.`)) return;
-    try {
-      for (const id of ids) {
-        await services.deleteItem?.(id);
-      }
-      setItems((current) => current.filter((item) => !ids.includes(item.id)));
-      setToast(`${ids.length} ${ids.length === 1 ? 'item' : 'items'} deleted.`);
-      setWardrobeMode(null);
-    } catch (error) {
-      setToast(error?.message || 'Those items could not be deleted.');
-    }
+  const bulkDeleteWardrobe = (ids) => {
+    setWardrobeMode(null);
+    removeItemsWithUndo(ids, `${plural(ids.length, 'item')} deleted.`);
   };
 
   return (
@@ -659,7 +834,7 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
           <span>Outfit Picker</span>
         </button>
         <button className="header-action" type="button" onClick={() => goToTab('upload')} aria-label="Add clothes">
-          <span>＋</span>
+          <span aria-hidden="true"><Plus /></span>
         </button>
       </header>
 
@@ -702,6 +877,7 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
             onToast={setToast}
             feedback={feedback}
             weatherLocation={weatherLocation}
+            isLoading={isLoading}
           />
         )}
         {activeTab === 'journal' && (
@@ -736,11 +912,11 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
       </main>
 
       <nav className="bottom-nav" aria-label="Primary navigation">
-        <NavButton icon="▦" label="Wardrobe" active={activeTab === 'wardrobe'} onClick={() => goToTab('wardrobe')} />
-        <NavButton icon="＋" label="Add" active={activeTab === 'upload'} onClick={() => goToTab('upload')} />
-        <NavButton icon="✦" label="Outfit" active={activeTab === 'outfit'} onClick={() => goToTab('outfit')} />
-        <NavButton icon="◷" label="Journal" active={activeTab === 'journal'} onClick={() => goToTab('journal')} />
-        <NavButton icon="⚙" label="Settings" active={activeTab === 'settings'} onClick={() => goToTab('settings')} />
+        <NavButton icon={<LayoutGrid />} label="Wardrobe" active={activeTab === 'wardrobe'} onClick={() => goToTab('wardrobe')} />
+        <NavButton icon={<Plus />} label="Add" active={activeTab === 'upload'} onClick={() => goToTab('upload')} />
+        <NavButton icon={<Sparkles />} label="Today" active={activeTab === 'outfit'} onClick={() => goToTab('outfit')} />
+        <NavButton icon={<CalendarDays />} label="Journal" active={activeTab === 'journal'} onClick={() => goToTab('journal')} />
+        <NavButton icon={<Settings />} label="Settings" active={activeTab === 'settings'} onClick={() => goToTab('settings')} />
       </nav>
 
       {editingItem && (
@@ -750,6 +926,8 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
           onClose={() => setEditingItem(null)}
           onSave={updateItem}
           onDelete={deleteItem}
+          locate={services.locateItem}
+          onToast={setToast}
         />
       )}
       {photoCheckOpen && (
@@ -759,9 +937,8 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
           analyze={services.analyzeOutfitPhoto}
           weatherLocation={weatherLocation}
           onClose={() => setPhotoCheckOpen(false)}
-          onLog={async (itemIds, verdict) => {
-            await wearOutfit({ itemIds, date: localDate(), source: 'photo', explanation: verdict });
-            setToast('Logged as worn today.');
+          onLog={async (itemIds, verdict, onUndone) => {
+            await wearOutfit({ itemIds, date: localDate(), source: 'photo', explanation: verdict, message: 'Logged as worn today.', onUndone });
           }}
           onToast={setToast}
         />
@@ -776,7 +953,12 @@ export default function App({ services = EMPTY_SERVICES, initialItems = [], relo
         />
       )}
       <div className="toast-region" role="status" aria-live="polite">
-        {toast && <div className="toast">{toast}</div>}
+        {toast && (
+          <div className="toast">
+            <span>{toast.message}</span>
+            {toast.undoable && <button className="toast-undo" type="button" onClick={undoLast}>Undo</button>}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -862,8 +1044,8 @@ function WardrobeView({
       {!selecting && items.length > 0 && (
         <>
           <button className="suggest-strip" type="button" onClick={onSuggest}>
-            <span className="sparkle">✦</span>
-            <span><strong>Pick an outfit for me</strong><small>Tell me the plan, I’ll do the styling</small></span>
+            <span className="sparkle"><Sparkles aria-hidden="true" /></span>
+            <span><strong>See today’s outfit</strong><small>Picked for the weather, ready to wear</small></span>
             <span className="arrow">→</span>
           </button>
           <button className="secondary-button full-width select-toggle" type="button" onClick={() => onSetMode('edit')}>
@@ -921,7 +1103,7 @@ function WardrobeView({
           })}
           {!selecting && (
             <button className="add-card" type="button" onClick={onAdd}>
-              <span>＋</span>
+              <span aria-hidden="true"><Plus /></span>
               <strong>Add a piece</strong>
             </button>
           )}
@@ -984,7 +1166,7 @@ function EmptyWardrobe({ filter, onAdd }) {
   const filtered = filter !== 'all';
   return (
     <div className="empty-state wardrobe-empty">
-      <div className="empty-illustration"><span>✦</span><span>⌁</span><span>◌</span></div>
+      <div className="empty-illustration" aria-hidden="true"><span><Sparkles /></span><span><Shirt /></span><span><Footprints /></span></div>
       <h2>{filtered ? `No ${displayCategory(filter).toLowerCase()} yet` : 'Your wardrobe starts here'}</h2>
       <p>{filtered ? 'Try another category, or add something new.' : 'Snap a photo of a piece or a full outfit. We’ll help sort every item.'}</p>
       <button className="primary-button" type="button" onClick={onAdd}>Add your first piece <span>→</span></button>
@@ -1221,13 +1403,13 @@ function UploadView({ tagPhoto, onSaveBatch, onCancel, onToast }) {
           <div><p className="eyebrow">ADD TO WARDROBE</p><h1>Show me your clothes</h1></div>
         </div>
         <div className="upload-dropzone">
-          <div className="camera-orb">◉</div>
+          <div className="camera-orb" aria-hidden="true"><Camera /></div>
           <h2>Choose your photos</h2>
           <p>Pick one or many. Single pieces, mirror selfies, and whole outfits all work. We’ll find the wearable items, not the background.</p>
           <button className="primary-button" type="button" onClick={() => inputRef.current?.click()}>Choose photos <span>→</span></button>
           <small>Up to {MAX_BATCH_PHOTOS} at a time · JPG, PNG, HEIC and more</small>
         </div>
-        <div className="tip-card"><span>✦</span><p><strong>Tip:</strong> Natural photos are perfect. You don’t need product shots or a plain background.</p></div>
+        <div className="tip-card"><span aria-hidden="true"><Sparkles /></span><p><strong>Tip:</strong> Natural photos are perfect. You don’t need product shots or a plain background.</p></div>
         <input ref={inputRef} className="visually-hidden" type="file" accept="image/*" multiple onChange={addFiles} />
       </section>
     );
@@ -1254,13 +1436,13 @@ function UploadView({ tagPhoto, onSaveBatch, onCancel, onToast }) {
               {entry.status === 'done' && <span className="batch-badge ok">✓</span>}
               {entry.status === 'failed' && <span className="batch-badge bad">!</span>}
               {!busy && (
-                <button className="batch-remove" type="button" aria-label="Remove this photo" onClick={() => removeEntry(entry.id)}>×</button>
+                <button className="batch-remove" type="button" aria-label="Remove this photo" onClick={() => removeEntry(entry.id)}><X aria-hidden="true" /></button>
               )}
             </figure>
           ))}
           {!busy && entries.length < MAX_BATCH_PHOTOS && (
             <button className="batch-tile batch-add" type="button" onClick={() => inputRef.current?.click()}>
-              <span>＋</span><small>Add more</small>
+              <span aria-hidden="true"><Plus /></span><small>Add more</small>
             </button>
           )}
         </div>
@@ -1276,7 +1458,7 @@ function UploadView({ tagPhoto, onSaveBatch, onCancel, onToast }) {
         ) : (
           <>
             <button className="primary-button full-width" type="button" onClick={analyseAll}>
-              Auto-tag {entries.length === 1 ? 'this photo' : `all ${entries.length} photos`} <span>✦</span>
+              Auto-tag {entries.length === 1 ? 'this photo' : `all ${entries.length} photos`} <span className="button-icon" aria-hidden="true"><Sparkles /></span>
             </button>
             <button className="secondary-button full-width" type="button" onClick={tagManually}>Tag them myself</button>
             <button className="text-button centered" type="button" onClick={onCancel}>Cancel</button>
@@ -1334,7 +1516,7 @@ function UploadView({ tagPhoto, onSaveBatch, onCancel, onToast }) {
               />
             ))}
           </div>
-          <button className="secondary-button compact" type="button" onClick={() => addItem(entry.id)}>＋ Split / add a piece</button>
+          <button className="secondary-button compact" type="button" onClick={() => addItem(entry.id)}><Plus className="inline-icon" aria-hidden="true" /> Split / add a piece</button>
         </div>
       ))}
 
@@ -1356,8 +1538,15 @@ function ReviewItemCard({ item, index, preview, selected, onToggleMerge, onChang
         <button className="icon-text-button danger-text" type="button" onClick={onRemove}>Remove</button>
       </div>
       <div className="review-visual">
-        <img src={preview} alt={`Source photo for detected item ${index + 1}`} style={cropStyle(item.crop)} />
-        <span className="crop-label">Crop preview</span>
+        <CroppedImage src={preview} crop={item.crop} alt={`Detected piece ${index + 1}`} className="review-crop" />
+        {spotlightStyle(item.crop) && (
+          // Where this piece is in the whole photo, so a wrong guess is obvious.
+          <span className="review-locator" aria-hidden="true">
+            <img src={preview} alt="" />
+            <span className="spotlight-box" style={spotlightStyle(item.crop)} />
+          </span>
+        )}
+        <span className="crop-label">{item.crop ? 'Found in your photo' : 'Crop preview'}</span>
       </div>
       <CropControls crop={item.crop} idPrefix={`review-${item.id}`} onChange={(crop) => onChange({ crop })} />
       <div className="form-grid review-fields">
@@ -1371,19 +1560,54 @@ function ReviewItemCard({ item, index, preview, selected, onToggleMerge, onChang
   );
 }
 
+/**
+ * An outfit laid out the way it's worn: top over bottom over shoes (or a
+ * dress over shoes) down the middle, with a layer and extras alongside. Each
+ * slot's shape suits its garment, tall for trousers and wide for shoes, so a
+ * cropped piece fills it naturally.
+ */
+function OutfitLook({ items, blobUrls, className = '' }) {
+  const of = (category) => items.filter((item) => item.category === category);
+  const [dress] = of('dress');
+  const [top, ...moreTops] = of('top');
+  const [bottom, ...moreBottoms] = of('bottom');
+  const [shoes, ...moreShoes] = of('shoes');
+  const main = dress
+    ? [[dress, 'dress']]
+    : [top && [top, 'top'], bottom && [bottom, 'bottom']].filter(Boolean);
+  if (shoes) main.push([shoes, 'shoes']);
+  const side = [...of('outerwear'), ...of('accessory'), ...moreTops, ...moreBottoms, ...moreShoes, ...(dress ? of('top').concat(of('bottom')) : [])]
+    .filter((item, index, all) => all.indexOf(item) === index);
+
+  const slot = (item, kind) => (
+    <figure className={`look-slot look-${kind}`} key={item.id}>
+      <Photo item={item} blobUrls={blobUrls} className="look-photo" alt={`${displayCategory(item.category)}${item.colors.length ? `, ${item.colors.join(' ')}` : ''}`} />
+      <figcaption>{displayCategory(item.category)}</figcaption>
+    </figure>
+  );
+
+  return (
+    <div className={`outfit-look ${side.length ? 'has-side' : ''} ${className}`}>
+      <div className="look-main">{main.map(([item, kind]) => slot(item, kind))}</div>
+      {side.length > 0 && <div className="look-side">{side.map((item) => slot(item, 'side'))}</div>}
+    </div>
+  );
+}
+
 function OutfitView({
   items, blobUrls, repeatDays, onSuggest, onWearOutfit, onRateOutfit, onAdd, onBuildOwn, onOpenPhotoCheck, onToast,
-  feedback = EMPTY_FEEDBACK, weatherLocation,
+  feedback = EMPTY_FEEDBACK, weatherLocation, isLoading = false,
 }) {
-  const [preferences, setPreferences] = useState({
-    occasion: 'Everyday',
+  const [preferences, setPreferences] = useState(() => ({
     weather: 'mild',
     temperature: 20,
     rain: false,
     forecastNote: '',
-    vibe: 'Easy',
     wantedItemId: '',
-  });
+    // The occasion and vibe last chosen, so a work week doesn't start from "Everyday" each morning.
+    ...getOutfitPreferences(),
+  }));
+  const [isAdjusting, setIsAdjusting] = useState(false);
   const [suggestion, setSuggestion] = useState(null);
   const [usedItemIds, setUsedItemIds] = useState([]);
   const [isThinking, setIsThinking] = useState(false);
@@ -1403,15 +1627,53 @@ function OutfitView({
       rain: today.rain,
       forecastNote: forecastNote(today, weatherLocation?.shortName),
     }));
+    // The forecast arrived after the first pick: re-pick for the real weather.
+    setSuggestion((current) => (current?.isQuick ? null : current));
   }, [today, weatherTouched, weatherLocation?.shortName]);
+
+  // Anything changed in Adjust shows a fresh pick straight away, and the
+  // occasion and vibe are remembered for next time.
+  const updatePreferences = (changes) => {
+    const next = { ...preferences, ...changes };
+    setPreferences(next);
+    setOutfitPreferences(next);
+    setSuggestion(null);
+  };
 
   const pickWeather = (option) => {
     setWeatherTouched(true);
-    setPreferences((current) => ({ ...current, weather: option.value, temperature: option.temperature, rain: false, forecastNote: '' }));
+    updatePreferences({ weather: option.value, temperature: option.temperature, rain: false, forecastNote: '' });
   };
+
+  // The outfit shown on arrival: the best-ranked local pick, instant and free.
+  // The AI stylist is one tap away rather than the only way to see anything.
+  const makeQuickPick = (exclude = []) => ({
+    ...localOutfit(
+      items.filter((item) => item.id === preferences.wantedItemId || !exclude.includes(item.id)),
+      suggestionFilters(preferences, feedback),
+      repeatDays,
+    ),
+    explanation: '',
+    isFallback: false,
+    source: 'local',
+    isQuick: true,
+  });
 
   const suggestionItems = suggestion?.itemIds.map((id) => items.find((item) => item.id === id)).filter(Boolean) || [];
   const availableItems = items.filter(isAvailable);
+
+  // Show a pick on arrival, after any adjustment, and whenever a piece in the
+  // current pick is deleted or taken out of rotation.
+  useEffect(() => {
+    if (isLoading || !items.length) return;
+    const stillWearable = suggestion?.itemIds.every((id) => items.some((item) => item.id === id && (isAvailable(item) || id === preferences.wantedItemId)));
+    if (suggestion && stillWearable) return;
+    setSuggestion(makeQuickPick());
+    setUsedItemIds([]);
+    setIsWorn(false);
+    setRating('');
+    // makeQuickPick reads the same inputs listed here.
+  }, [isLoading, items, preferences, suggestion]);
 
   const requestSuggestion = async ({ exclude = [] } = {}) => {
     const candidates = shortlistForSuggestion(items, preferences, repeatDays, exclude, feedback);
@@ -1495,10 +1757,12 @@ function OutfitView({
     setUsedItemIds(exclude);
   };
 
+  // "Another one" stays with whatever made the current pick: the AI asks the
+  // AI again, while a quick pick or shuffle shuffles.
   const reroll = () => {
     const exclude = [...usedItemIds, ...suggestion.itemIds];
-    if (suggestion.source === 'shuffle') requestShuffle({ exclude });
-    else requestSuggestion({ exclude });
+    if (suggestion.source === 'ai' || suggestion.isFallback) requestSuggestion({ exclude });
+    else requestShuffle({ exclude: suggestion.source === 'shuffle' ? exclude : suggestion.itemIds });
   };
 
   const wearThis = async () => {
@@ -1509,9 +1773,10 @@ function OutfitView({
         date: localDate(),
         source: suggestion.source,
         explanation: suggestion.explanation,
+        message: 'Marked as worn today. Have a great time!',
+        onUndone: () => setIsWorn(false),
       });
       setIsWorn(true);
-      onToast('Marked as worn today. Have a great time!');
     } catch (error) {
       onToast(error?.message || 'That outfit could not be marked as worn.');
     }
@@ -1520,19 +1785,23 @@ function OutfitView({
   const rate = async (value) => {
     if (!suggestionItems.length || rating) return;
     try {
+      const ruledOut = suggestion;
       await onRateOutfit({
         itemIds: suggestionItems.map((item) => item.id),
         rating: value,
         source: suggestion.source,
         explanation: suggestion.explanation,
+        message: value === 'loved'
+          ? 'Loved. Pieces from it will come up a little more often.'
+          : 'Got it. That pairing won\'t be suggested again.',
+        // Undo brings back the outfit that was ruled out, not just the record.
+        onUndone: () => {
+          setRating('');
+          if (value === 'rejected') setSuggestion(ruledOut);
+        },
       });
       setRating(value);
-      if (value === 'loved') {
-        onToast('Loved. Pieces from it will come up a little more often.');
-      } else {
-        onToast('Got it. That pairing won\'t be suggested again. Undo it under Journal.');
-        reroll();
-      }
+      if (value === 'rejected') reroll();
     } catch (error) {
       onToast(error?.message || 'That could not be saved.');
     }
@@ -1541,12 +1810,12 @@ function OutfitView({
   // Block only on a genuinely empty wardrobe. A wardrobe missing one category
   // (no shoes yet, say) still deserves a suggestion — it just says so, rather
   // than refusing outright.
-  if (!items.length) {
+  if (!items.length && !isLoading) {
     return (
       <section className="screen outfit-screen empty-outfit">
         <div className="screen-heading"><div><p className="eyebrow">OUTFIT PICKER</p><h1>Let’s get dressed</h1></div></div>
         <div className="empty-state">
-          <div className="empty-illustration warm"><span>✦</span><span>◐</span><span>⌁</span></div>
+          <div className="empty-illustration warm" aria-hidden="true"><span><Sparkles /></span><span><Shirt /></span><span><TrousersIcon /></span></div>
           <h2>Add a few pieces first</h2>
           <p>Once you have added some clothes, I can start assembling outfits.</p>
           <button className="primary-button" type="button" onClick={onAdd}>Add clothes <span>→</span></button>
@@ -1555,88 +1824,105 @@ function OutfitView({
     );
   }
 
-  if (suggestion) {
-    return (
-      <section className="screen outfit-screen result-screen">
-        <button className="text-button back-button" type="button" onClick={() => setSuggestion(null)}>← Change answers</button>
-        <p className="eyebrow">YOUR OUTFIT</p>
-        <h1>Here’s the move</h1>
-        <div className="answer-summary"><span>{preferences.occasion}</span><span>{preferences.vibe}</span><span>{preferences.temperature}°{preferences.rain ? ' · rain' : ''}</span></div>
-        <div className="outfit-row">
-          {suggestionItems.map((item) => (
-            <div className="outfit-piece" key={item.id}>
-              <Photo item={item} blobUrls={blobUrls} className="outfit-photo" alt={`${displayCategory(item.category)} in suggested outfit`} />
-              <span>{displayCategory(item.category)}</span>
-            </div>
-          ))}
+  const missing = missingForCompleteOutfit(availableItems);
+  const isAi = suggestion?.source === 'ai' && !suggestion.isFallback;
+  const weatherLabel = WEATHER_OPTIONS.find((option) => option.value === preferences.weather)?.label || preferences.weather;
+
+  return (
+    <section className="screen outfit-screen today-screen">
+      <div className="screen-heading">
+        <div>
+          <p className="eyebrow">TODAY · {new Intl.DateTimeFormat(undefined, { weekday: 'long', day: 'numeric', month: 'short' }).format(new Date()).toUpperCase()}</p>
+          <h1>{isAi ? 'Styled for you' : 'Your outfit today'}</h1>
         </div>
-        {suggestion.isFallback && (
-          <p className="inline-note">This is a basic pick, not an AI suggestion — styling failed this time.</p>
-        )}
-        <div className="explanation-card"><span>✦</span><p>{suggestion.explanation}</p></div>
-        <div className="recent-note">Avoiding pieces worn in the last {repeatDays} days where possible.</div>
-        <button className={`primary-button full-width ${isWorn ? 'success-button' : ''}`} type="button" onClick={wearThis} disabled={isWorn}>
-          {isWorn ? '✓ Worn today' : 'Wear this'}
+      </div>
+
+      {today && !weatherTouched && (
+        <p className="forecast-line"><CloudSun className="inline-icon" aria-hidden="true" /> {weatherLocation.shortName}: {describeDay(today)}{today.rain ? ' — rain likely' : ''}</p>
+      )}
+      {weatherLocation && forecast.error && <p className="forecast-line">Live weather unavailable: {forecast.error}</p>}
+
+      <button className="adjust-summary" type="button" aria-expanded={isAdjusting} onClick={() => setIsAdjusting((current) => !current)}>
+        <span>{preferences.occasion}</span>
+        <span>{weatherLabel} {preferences.temperature}°{preferences.rain ? ' · rain' : ''}</span>
+        <span>{preferences.vibe}</span>
+        {preferences.wantedItemId && <span>With a chosen piece</span>}
+        <strong>{isAdjusting ? 'Done' : 'Adjust'}</strong>
+      </button>
+
+      {isAdjusting && (
+        <div className="adjust-panel">
+          <fieldset className="question-block">
+            <legend>Where are you going?</legend>
+            <div className="chip-row">
+              {OCCASIONS.map((occasion) => <ChoiceButton key={occasion} active={preferences.occasion === occasion} onClick={() => updatePreferences({ occasion })}>{occasion}</ChoiceButton>)}
+            </div>
+          </fieldset>
+          <fieldset className="question-block">
+            <legend>The weather</legend>
+            <div className="choice-grid weather-grid">
+              {WEATHER_OPTIONS.map((weather) => <ChoiceButton key={weather.value} active={preferences.weather === weather.value} onClick={() => pickWeather(weather)}>{weather.label}<small>{preferences.weather === weather.value && !weatherTouched && today ? `${today.temperature}°` : `${weather.temperature}°`}</small></ChoiceButton>)}
+            </div>
+            {!weatherLocation && <p className="field-hint">Turn on live weather in Settings and this fills itself in.</p>}
+          </fieldset>
+          <fieldset className="question-block">
+            <legend>How do you want to feel?</legend>
+            <div className="chip-row">
+              {VIBES.map((vibe) => <ChoiceButton key={vibe} active={preferences.vibe === vibe} onClick={() => updatePreferences({ vibe })}>{vibe}</ChoiceButton>)}
+            </div>
+          </fieldset>
+          <label className="wanted-select">Build it around a piece<select value={preferences.wantedItemId} onChange={(event) => updatePreferences({ wantedItemId: event.target.value })}><option value="">No — surprise me</option>{availableItems.map((item) => <option key={item.id} value={item.id}>{displayCategory(item.category)} · {item.colors.join(', ') || 'untitled item'}</option>)}</select></label>
+        </div>
+      )}
+
+      {missing.length > 0 && (
+        <p className="inline-note">No {missing.join(' or ')} in rotation yet — I’ll style what you have.</p>
+      )}
+
+      {isLoading || !suggestion ? (
+        <div className="outfit-look look-skeleton" aria-hidden="true"><div className="look-main"><div className="card-skeleton" /><div className="card-skeleton" /></div></div>
+      ) : suggestionItems.length ? (
+        <OutfitLook items={suggestionItems} blobUrls={blobUrls} />
+      ) : (
+        <p className="inline-note">Nothing in rotation fits these answers. Adjust them, or bring something back from the wash.</p>
+      )}
+
+      {suggestion?.isFallback && (
+        <p className="inline-note">The AI stylist didn’t answer this time, so this is the best match from your wardrobe.</p>
+      )}
+      {isAi && suggestion.explanation && <div className="explanation-card"><span aria-hidden="true"><Sparkles /></span><p>{suggestion.explanation}</p></div>}
+      {!isAi && !suggestion?.isFallback && suggestionItems.length > 0 && (
+        <p className="pick-source">{suggestion.source === 'shuffle' ? 'Shuffled from your wardrobe.' : `Best match for ${preferences.occasion.toLowerCase()}, ${weatherLabel.toLowerCase()} weather.`} Not worn in the last {repeatDays} days where possible.</p>
+      )}
+
+      <button className={`primary-button full-width ${isWorn ? 'success-button' : ''}`} type="button" onClick={wearThis} disabled={isWorn || !suggestionItems.length}>
+        {isWorn ? '✓ Worn today' : 'Wear this'}
+      </button>
+      <div className="outfit-secondary-actions">
+        <button className="secondary-button" type="button" disabled={isThinking || !suggestionItems.length} onClick={() => (isAi ? reroll() : requestShuffle({ exclude: suggestion.source === 'shuffle' ? [...usedItemIds, ...suggestion.itemIds] : suggestion.itemIds }))}>
+          {isAi ? <>Ask again <span className="button-icon" aria-hidden="true"><RefreshCw /></span></> : <>Shuffle <span className="button-icon" aria-hidden="true"><Shuffle /></span></>}
         </button>
+        <button className="secondary-button ai-button" type="button" disabled={isThinking} onClick={() => (hasAnyProvider() ? requestSuggestion({ exclude: isAi ? [...usedItemIds, ...suggestion.itemIds] : [] }) : onToast('Connect the built-in AI or a provider in Settings to use the AI stylist.'))}>
+          {isThinking ? <><span className="button-spinner dark" /> Styling…</> : <>AI stylist <span className="button-icon" aria-hidden="true"><Sparkles /></span></>}
+        </button>
+      </div>
+      {suggestionItems.length > 0 && (
         <div className="rating-row">
           <button className={`secondary-button ${rating === 'loved' ? 'is-loved' : ''}`} type="button" disabled={Boolean(rating) || isThinking} onClick={() => rate('loved')}>
-            {rating === 'loved' ? '♥ Loved' : '♡ Love it'}
+            {rating === 'loved' ? <><Heart className="inline-icon" fill="currentColor" aria-hidden="true" /> Loved</> : <><Heart className="inline-icon" aria-hidden="true" /> Love it</>}
           </button>
           <button className="secondary-button" type="button" disabled={Boolean(rating) || isThinking} onClick={() => rate('rejected')}>
             Never suggest this
           </button>
         </div>
-        <button className="secondary-button full-width" type="button" disabled={isThinking} onClick={reroll}>
-          {isThinking ? <><span className="button-spinner dark" /> Finding another…</> : <>{suggestion.source === 'shuffle' ? 'Shuffle again' : 'Suggest another'} <span>↻</span></>}
-        </button>
-      </section>
-    );
-  }
-
-  const missing = missingForCompleteOutfit(items);
-
-  return (
-    <section className="screen outfit-screen question-screen">
-      <div className="screen-heading"><div><p className="eyebrow">OUTFIT PICKER</p><h1>What’s the plan?</h1><p className="heading-copy">A few details and I’ll pull a look from your closet.</p></div></div>
-      {missing.length > 0 && (
-        <p className="inline-note">
-          No {missing.join(' or ')} in your wardrobe yet — I’ll style what you have.
-        </p>
       )}
-      <fieldset className="question-block">
-        <legend>Where are you going?</legend>
-        <div className="choice-grid occasion-grid">
-          {OCCASIONS.map((occasion) => <ChoiceButton key={occasion} active={preferences.occasion === occasion} onClick={() => setPreferences((current) => ({ ...current, occasion }))}>{occasion}</ChoiceButton>)}
-        </div>
-      </fieldset>
-      <fieldset className="question-block">
-        <legend>What’s the weather?</legend>
-        {today && !weatherTouched && (
-          <p className="forecast-line"><span aria-hidden="true">☁</span> {weatherLocation.shortName} today: {describeDay(today)}{today.rain ? ' — rain likely' : ''}</p>
-        )}
-        {weatherLocation && forecast.error && <p className="forecast-line">Live weather unavailable: {forecast.error}</p>}
-        <div className="choice-grid weather-grid">
-          {WEATHER_OPTIONS.map((weather) => <ChoiceButton key={weather.value} active={preferences.weather === weather.value} onClick={() => pickWeather(weather)}>{weather.label}<small>{preferences.weather === weather.value && !weatherTouched && today ? `${today.temperature}°` : `${weather.temperature}°`}</small></ChoiceButton>)}
-        </div>
-        {!weatherLocation && <p className="field-hint">Tip: turn on live weather in Settings and this fills itself in.</p>}
-      </fieldset>
-      <fieldset className="question-block">
-        <legend>How do you want to feel?</legend>
-        <div className="vibe-row">
-          {VIBES.map((vibe) => <ChoiceButton key={vibe} active={preferences.vibe === vibe} onClick={() => setPreferences((current) => ({ ...current, vibe }))}>{vibe}</ChoiceButton>)}
-        </div>
-      </fieldset>
-      <label className="wanted-select">Want to wear something specific?<select value={preferences.wantedItemId} onChange={(event) => setPreferences((current) => ({ ...current, wantedItemId: event.target.value }))}><option value="">No preference — surprise me</option>{availableItems.map((item) => <option key={item.id} value={item.id}>{displayCategory(item.category)} · {item.colors.join(', ') || 'untitled item'}</option>)}</select></label>
-      <button className="primary-button full-width suggest-button" type="button" disabled={isThinking} onClick={() => requestSuggestion()}>{isThinking ? <><span className="button-spinner" /> Styling your look…</> : <>Suggest my outfit <span>✦</span></>}</button>
-      <div className="outfit-secondary-actions">
-        <button className="secondary-button" type="button" onClick={() => requestShuffle()}>Shuffle instead <span>↻</span></button>
-        <button className="secondary-button" type="button" onClick={onBuildOwn}>Build it myself <span>→</span></button>
-      </div>
+
       <button className="photo-check-strip" type="button" onClick={onOpenPhotoCheck}>
-        <span aria-hidden="true">◎</span>
+        <span aria-hidden="true"><Camera /></span>
         <span><strong>Already dressed?</strong><small>Snap a mirror photo to log it and get honest feedback</small></span>
         <span className="arrow">→</span>
       </button>
+      <button className="text-button build-own" type="button" onClick={onBuildOwn}>Or pick the pieces yourself →</button>
     </section>
   );
 }
@@ -1664,7 +1950,7 @@ function JournalView({
       <section className="screen journal-screen empty-outfit">
         <div className="screen-heading"><div><p className="eyebrow">JOURNAL</p><h1>Your outfit history</h1></div></div>
         <div className="empty-state">
-          <div className="empty-illustration"><span>◷</span><span>✦</span><span>◐</span></div>
+          <div className="empty-illustration" aria-hidden="true"><span><CalendarDays /></span><span><Sparkles /></span><span><Shirt /></span></div>
           <h2>Nothing logged yet</h2>
           <p>Add a few pieces, then wear or plan an outfit and it will show up here.</p>
           <button className="primary-button" type="button" onClick={onAdd}>Add clothes <span>→</span></button>
@@ -1694,8 +1980,8 @@ function JournalView({
       {segment === 'history' && (
         <>
           <div className="outfit-secondary-actions">
-            <button className="secondary-button" type="button" onClick={onPlanOutfit}>＋ Plan an outfit</button>
-            <button className="secondary-button" type="button" onClick={onOpenPhotoCheck}>◎ Log from a photo</button>
+            <button className="secondary-button" type="button" onClick={onPlanOutfit}><Plus className="inline-icon" aria-hidden="true" /> Plan an outfit</button>
+            <button className="secondary-button" type="button" onClick={onOpenPhotoCheck}><Camera className="inline-icon" aria-hidden="true" /> Log from a photo</button>
           </div>
           {visibleRecords.length ? (
             <div className="journal-list">
@@ -1711,7 +1997,7 @@ function JournalView({
                     <span className={`journal-badge journal-badge-${record.status}`}>{JOURNAL_BADGES[record.status]}</span>
                     {record.occasion && <small>{record.occasion}</small>}
                   </div>
-                  <button className="icon-text-button danger-text" type="button" onClick={() => onDeleteOutfitRecord(record.id)} aria-label="Remove this entry">×</button>
+                  <button className="icon-text-button danger-text" type="button" onClick={() => onDeleteOutfitRecord(record.id)} aria-label="Remove this entry"><X aria-hidden="true" /></button>
                 </div>
               ))}
             </div>
@@ -1880,7 +2166,7 @@ function WeekPlanner({ items, blobUrls, feedback, repeatDays, weatherLocation, o
 
   return (
     <section className="settings-card planner-card">
-      <div className="settings-card-heading"><span className="settings-icon">▤</span><div><h2>Plan my week</h2><p>Seven outfits, no top or bottom repeated while there are others to wear.</p></div></div>
+      <div className="settings-card-heading"><span className="settings-icon" aria-hidden="true"><CalendarRange /></span><div><h2>Plan my week</h2><p>Seven outfits, no top or bottom repeated while there are others to wear.</p></div></div>
       {!plan ? (
         <>
           <div className="form-grid">
@@ -1903,7 +2189,7 @@ function WeekPlanner({ items, blobUrls, feedback, repeatDays, weatherLocation, o
                 {day.itemIds.length
                   ? <OutfitThumbs itemIds={day.itemIds} itemsById={itemsById} blobUrls={blobUrls} />
                   : <small className="plan-empty">Nothing suitable</small>}
-                <button className="icon-text-button" type="button" onClick={() => reshuffleDay(index)} aria-label={`Shuffle ${weekday(day.date)}`}>↻</button>
+                <button className="icon-text-button" type="button" onClick={() => reshuffleDay(index)} aria-label={`Shuffle ${weekday(day.date)}`}><RefreshCw aria-hidden="true" /></button>
               </div>
             ))}
           </div>
@@ -1979,7 +2265,7 @@ function TripPlanner({ items, blobUrls, feedback, onSavePlan, onToast }) {
 
   return (
     <section className="settings-card planner-card">
-      <div className="settings-card-heading"><span className="settings-icon">✈</span><div><h2>Pack for a trip</h2><p>The fewest pieces that cover every day, with an outfit for each.</p></div></div>
+      <div className="settings-card-heading"><span className="settings-icon" aria-hidden="true"><Plane /></span><div><h2>Pack for a trip</h2><p>The fewest pieces that cover every day, with an outfit for each.</p></div></div>
       {!trip ? (
         <>
           <form className="place-search" onSubmit={search}>
@@ -2069,7 +2355,7 @@ function CapsuleBuilder({ items, blobUrls, buildCapsule, onToast }) {
 
   return (
     <section className="settings-card planner-card">
-      <div className="settings-card-heading"><span className="settings-icon">◇</span><div><h2>Build a capsule</h2><p>The pieces you own that mix into the most outfits.</p></div></div>
+      <div className="settings-card-heading"><span className="settings-icon" aria-hidden="true"><Gem /></span><div><h2>Build a capsule</h2><p>The pieces you own that mix into the most outfits.</p></div></div>
       {!hasAi && <p className="inline-note">This one uses AI. Connect the built-in AI or a provider in Settings.</p>}
       <div className="form-grid">
         <label>Pieces<select value={size} onChange={(event) => setSize(Number(event.target.value))}>{[10, 12, 15].map((option) => <option key={option} value={option}>{option}</option>)}</select></label>
@@ -2081,7 +2367,7 @@ function CapsuleBuilder({ items, blobUrls, buildCapsule, onToast }) {
       {capsule && (
         <div className="capsule-result">
           <OutfitThumbs itemIds={capsule.itemIds} itemsById={itemsById} blobUrls={blobUrls} className="capsule-photo" />
-          {capsule.explanation && <div className="explanation-card"><span>✦</span><p>{capsule.explanation}</p></div>}
+          {capsule.explanation && <div className="explanation-card"><span aria-hidden="true"><Sparkles /></span><p>{capsule.explanation}</p></div>}
           {capsule.outfits.length > 0 && (
             <>
               <h3>{plural(capsule.outfits.length, 'example outfit')}</h3>
@@ -2197,7 +2483,7 @@ function OutfitPhotoModal({ items, blobUrls, analyze, weatherLocation, onClose, 
 
   const log = async () => {
     try {
-      await onLog(matchedIds, result?.verdict || '');
+      await onLog(matchedIds, result?.verdict || '', () => setIsLogged(false));
       setIsLogged(true);
     } catch (error) {
       onToast(error?.message || 'That outfit could not be logged.');
@@ -2212,7 +2498,7 @@ function OutfitPhotoModal({ items, blobUrls, analyze, weatherLocation, onClose, 
         <div className="modal-handle" />
         <div className="editor-header">
           <div><p className="eyebrow">TODAY'S OUTFIT</p><h2 id="photo-check-title">Log it and get feedback</h2></div>
-          <button className="close-button" type="button" onClick={onClose} aria-label="Close">×</button>
+          <button className="close-button" type="button" onClick={onClose} aria-label="Close"><X aria-hidden="true" /></button>
         </div>
 
         <input ref={inputRef} type="file" accept="image/*" hidden onChange={choose} />
@@ -2220,7 +2506,7 @@ function OutfitPhotoModal({ items, blobUrls, analyze, weatherLocation, onClose, 
           ? <img className="photo-check-preview" src={previewUrl} alt="Your outfit photo" />
           : (
             <button className="photo-check-pick" type="button" onClick={() => inputRef.current?.click()}>
-              <span aria-hidden="true">◎</span>
+              <span aria-hidden="true"><Camera /></span>
               <strong>Take or choose a photo</strong>
               <small>A mirror selfie works best. Only this photo is sent to your AI provider.</small>
             </button>
@@ -2232,7 +2518,7 @@ function OutfitPhotoModal({ items, blobUrls, analyze, weatherLocation, onClose, 
           <>
             <label className="wanted-select">Dressed for<select value={occasion} onChange={(event) => setOccasion(event.target.value)}>{OCCASIONS.map((option) => <option key={option}>{option}</option>)}</select></label>
             <button className="primary-button full-width" type="button" disabled={!hasAi || isReading} onClick={read}>
-              {isReading ? <><span className="button-spinner" /> Looking…</> : <>Read my outfit <span>✦</span></>}
+              {isReading ? <><span className="button-spinner" /> Looking…</> : <>Read my outfit <span className="button-icon" aria-hidden="true"><Sparkles /></span></>}
             </button>
             <button className="text-button" type="button" onClick={() => inputRef.current?.click()}>Use a different photo</button>
           </>
@@ -2240,7 +2526,7 @@ function OutfitPhotoModal({ items, blobUrls, analyze, weatherLocation, onClose, 
 
         {result && (
           <>
-            <div className="explanation-card"><span>✦</span><p>{result.verdict || 'Here\'s what I see.'}</p></div>
+            <div className="explanation-card"><span aria-hidden="true"><Sparkles /></span><p>{result.verdict || 'Here\'s what I see.'}</p></div>
             {result.working.length > 0 && (
               <section className="feedback-section">
                 <h3>Working</h3>
@@ -2365,16 +2651,9 @@ function SaveLookModal({ items, blobUrls, itemIds, onClose, onSave }) {
         <div className="modal-handle" />
         <div className="editor-header">
           <div><p className="eyebrow">YOUR LOOK</p><h2 id="save-look-title">Save this outfit</h2></div>
-          <button className="close-button" type="button" onClick={onClose} aria-label="Close">×</button>
+          <button className="close-button" type="button" onClick={onClose} aria-label="Close"><X aria-hidden="true" /></button>
         </div>
-        <div className="outfit-row">
-          {selectedItems.map((item) => (
-            <div className="outfit-piece" key={item.id}>
-              <Photo item={item} blobUrls={blobUrls} className="outfit-photo" alt={displayCategory(item.category)} />
-              <span>{displayCategory(item.category)}</span>
-            </div>
-          ))}
-        </div>
+        <OutfitLook items={selectedItems} blobUrls={blobUrls} className="look-compact" />
         <div className="form-grid editor-fields">
           <label className="span-two">Date<input type="date" value={date} onChange={(event) => setDate(event.target.value || localDate())} /></label>
           <label className="span-two">Occasion (optional)<input value={occasion} placeholder="e.g. work, date night" onChange={(event) => setOccasion(event.target.value)} /></label>
@@ -2464,7 +2743,7 @@ function BackupCard({ exportBackup, onRestore, onToast, dataKey }) {
 
   return (
     <section className="settings-card">
-      <div className="settings-card-heading"><span className="settings-icon">⇩</span><div><h2>Backup</h2><p>Your wardrobe lives only in this browser. Save a backup file now and then, and restore it here or on another device. Keys are never included.</p></div></div>
+      <div className="settings-card-heading"><span className="settings-icon" aria-hidden="true"><Archive /></span><div><h2>Backup</h2><p>Your wardrobe lives only in this browser. Save a backup file now and then, and restore it here or on another device. Keys are never included.</p></div></div>
       <div className="backup-actions">
         {!useShareSheet && (
           <button className="secondary-button" type="button" disabled={isBusy} onClick={downloadBackup}>{isBusy ? 'Preparing…' : 'Download backup'}</button>
@@ -2541,7 +2820,7 @@ function WeatherCard({ location, onChange, onToast }) {
 
   return (
     <section className="settings-card">
-      <div className="settings-card-heading"><span className="settings-icon">☁</span><div><h2>Live weather</h2><p>Fills in the weather on the Outfit screen, and plans your week around the forecast.</p></div></div>
+      <div className="settings-card-heading"><span className="settings-icon" aria-hidden="true"><CloudSun /></span><div><h2>Live weather</h2><p>Fills in the weather on the Today screen, and plans your week around the forecast.</p></div></div>
       {location ? (
         <>
           <p className="forecast-line"><strong>{location.name}</strong>{today ? ` · today ${describeDay(today)}` : forecast.error ? ` · ${forecast.error}` : ''}</p>
@@ -2561,7 +2840,7 @@ function WeatherCard({ location, onChange, onToast }) {
           <button className="text-button" type="button" disabled={isBusy} onClick={useDevice}>Or use my location (rounded to about 10 km)</button>
         </>
       )}
-      <p className="privacy-note"><span>⌁</span>Forecasts come from Open-Meteo, free and with no account. Only the rounded place is sent, never your wardrobe.</p>
+      <p className="privacy-note"><span aria-hidden="true"><Lock /></span>Forecasts come from Open-Meteo, free and with no account. Only the rounded place is sent, never your wardrobe.</p>
     </section>
   );
 }
@@ -2603,7 +2882,7 @@ function SettingsView({ onClear, exportBackup, onRestore, onToast, dataKey, weat
 
       <section className="settings-card">
         <div className="settings-card-heading">
-          <span className="settings-icon">✦</span>
+          <span className="settings-icon" aria-hidden="true"><Sparkles /></span>
           <div><h2>AI providers</h2><p>Add any OpenAI-compatible API. Used only to tag photos and make outfit suggestions.</p></div>
         </div>
 
@@ -2672,16 +2951,16 @@ function SettingsView({ onClear, exportBackup, onRestore, onToast, dataKey, weat
             onToast={onToast}
           />
         ) : (
-          <button className="secondary-button full-width" type="button" onClick={() => setOpenFormId('new')}>＋ Add a provider</button>
+          <button className="secondary-button full-width" type="button" onClick={() => setOpenFormId('new')}><Plus className="inline-icon" aria-hidden="true" /> Add a provider</button>
         )}
 
-        <p className="privacy-note"><span>⌁</span>Each provider's key is saved locally on this device and is sent only to that provider, and only when you use a feature that needs it.</p>
+        <p className="privacy-note"><span aria-hidden="true"><Lock /></span>Each provider's key is saved locally on this device and is sent only to that provider, and only when you use a feature that needs it.</p>
       </section>
 
       <WeatherCard location={weatherLocation} onChange={onWeatherLocationChange} onToast={onToast} />
 
       <section className="settings-card">
-        <div className="settings-card-heading"><span className="settings-icon">◷</span><div><h2>Repeat protection</h2><p>Deprioritise pieces you wore recently.</p></div></div>
+        <div className="settings-card-heading"><span className="settings-icon" aria-hidden="true"><History /></span><div><h2>Repeat protection</h2><p>Deprioritise pieces you wore recently.</p></div></div>
         <div className="range-setting">
           <label htmlFor="repeat-days">Avoid repeats for <strong>{repeatDays} days</strong></label>
           <input id="repeat-days" type="range" min="0" max={MAX_REPEAT_DAYS} step="1" value={repeatDays} onChange={(event) => changeRepeatDays(Number(event.target.value))} />
@@ -2880,9 +3159,30 @@ function ProviderForm({ mode, initial, onCancel, onSave, onToast }) {
   );
 }
 
-function ItemEditor({ item, blobUrls, onClose, onSave, onDelete }) {
+function ItemEditor({ item, blobUrls, onClose, onSave, onDelete, locate, onToast }) {
   const [draft, setDraft] = useState(() => normalizeItem(item));
   const [isSaving, setIsSaving] = useState(false);
+  const [isLocating, setIsLocating] = useState(false);
+
+  // For pieces saved before tagging found each item's position: one AI call
+  // finds this piece in its photo and crops to it. Nothing is saved until
+  // "Save changes", so a bad guess is undone by closing the editor.
+  const findInPhoto = async () => {
+    setIsLocating(true);
+    try {
+      const crop = await locate(draft);
+      if (crop) {
+        setDraft((current) => ({ ...current, crop }));
+        onToast?.('Found it. Save changes to keep the new crop.');
+      } else {
+        onToast?.('Couldn\'t find this piece in the photo. Crop it by hand below.');
+      }
+    } catch (error) {
+      onToast?.(error?.message || 'That didn\'t work this time.');
+    } finally {
+      setIsLocating(false);
+    }
+  };
   const dialogRef = useRef(null);
   useEffect(() => setDraft(normalizeItem(item)), [item]);
 
@@ -2937,8 +3237,13 @@ function ItemEditor({ item, blobUrls, onClose, onSave, onDelete }) {
     <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <section className="item-editor" role="dialog" aria-modal="true" aria-labelledby="editor-title" ref={dialogRef} tabIndex={-1}>
         <div className="modal-handle" />
-        <div className="editor-header"><div><p className="eyebrow">EDIT PIECE</p><h2 id="editor-title">Make it yours</h2></div><button className="close-button" type="button" onClick={onClose} aria-label="Close editor">×</button></div>
+        <div className="editor-header"><div><p className="eyebrow">EDIT PIECE</p><h2 id="editor-title">Make it yours</h2></div><button className="close-button" type="button" onClick={onClose} aria-label="Close editor"><X aria-hidden="true" /></button></div>
         <PhotoSpotlight item={draft} blobUrls={blobUrls} className="editor-photo" />
+        {locate && hasAnyProvider() && (draft.photo || draft.imageUrl) && (
+          <button className="secondary-button full-width locate-button" type="button" disabled={isLocating} onClick={findInPhoto}>
+            {isLocating ? <><span className="button-spinner dark" /> Looking…</> : 'Find it in the photo'}
+          </button>
+        )}
         <CropControls crop={draft.crop} idPrefix={`editor-${draft.id}`} onChange={(crop) => update({ crop })} />
         <div className="form-grid editor-fields">
           <label>Category<select value={draft.category} onChange={(event) => update({ category: event.target.value })}>{CATEGORIES.map((category) => <option key={category} value={category}>{displayCategory(category)}</option>)}</select></label>

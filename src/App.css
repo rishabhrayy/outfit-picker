@@ -1,6 +1,6 @@
 :root {
   --ink: #252321;
-  --muted: #77716b;
+  --muted: #6c665f;
   --paper: #fffdf8;
   --canvas: #f8f5ef;
   --line: #e8e2d9;
@@ -85,12 +85,13 @@ button { -webkit-tap-highlight-color: transparent; }
 .bulk-action-row { display: flex; gap: 8px; }
 .bulk-action-row input, .bulk-action-row select { flex: 1; min-width: 0; border: 1px solid #ddd6cd; border-radius: 10px; padding: 9px 10px; font-size: 13px; background: #fffdf9; }
 .photo-frame { position: relative; overflow: hidden; display: block; }
-.photo-frame img { width: 100%; height: 100%; object-fit: cover; display: block; transition: transform .15s ease; }
+.photo-frame img { width: 100%; height: 100%; object-fit: cover; display: block; }
 /* The opposite of photo-frame: shows the whole photo (object-fit: contain, not
    cover) with a highlighted box over just the tagged region, instead of
    cropping everything else away. */
-.photo-spotlight { position: relative; overflow: hidden; display: block; }
-.photo-spotlight img { width: 100%; height: 100%; object-fit: contain; display: block; }
+.photo-spotlight { display: flex; justify-content: center; align-items: center; overflow: hidden; }
+.spotlight-stage { position: relative; display: block; height: 100%; overflow: hidden; }
+.spotlight-stage img { display: block; height: 100%; width: auto; max-width: 100%; object-fit: contain; }
 .spotlight-box { position: absolute; border: 2px solid var(--lime-deep); border-radius: 8px; box-shadow: 0 0 0 999px rgba(20,18,15,.45); pointer-events: none; }
 .key-warning { margin: 8px 0 0; padding: 9px 11px; border-radius: 10px; font-size: 11px; line-height: 1.45; color: #7a3a12; background: #fdf0e2; border: 1px solid #f0d5b4; }
 .settings-card .field-hint { margin: 7px 0 0; }
@@ -161,7 +162,10 @@ button { -webkit-tap-highlight-color: transparent; }
 .icon-text-button { font-size: 11px; padding: 3px; }
 .danger-text { color: var(--danger); }
 .review-visual { position: relative; height: 180px; overflow: hidden; background: #ebe5dc; border-radius: 13px; }
-.review-visual img { width: 100%; height: 100%; object-fit: cover; transition: transform .15s ease; }
+.review-crop { width: 100%; height: 100%; }
+.review-locator { position: absolute; left: 7px; bottom: 7px; height: 64px; border-radius: 6px; overflow: hidden; border: 2px solid white; box-shadow: 0 2px 6px rgba(0,0,0,.25); background: #ebe5dc; }
+.review-locator img { display: block; height: 100%; width: auto; }
+.review-locator .spotlight-box { border-width: 1.5px; border-radius: 2px; box-shadow: 0 0 0 999px rgba(20,18,15,.4); }
 .crop-label { position: absolute; right: 7px; bottom: 7px; color: white; background: rgba(0,0,0,.55); padding: 4px 6px; border-radius: 6px; font-size: 9px; }
 .crop-controls { display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 7px 12px; padding: 11px 0 4px; }
 .crop-controls label { font-size: 10px; color: var(--muted); letter-spacing: .04em; text-transform: uppercase; }
@@ -307,7 +311,7 @@ button { -webkit-tap-highlight-color: transparent; }
 .editor-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 14px; }
 .editor-header h2 { font-family: Georgia, serif; font-size: 28px; font-weight: 500; letter-spacing: -.05em; margin: 3px 0 0; }
 .close-button { width: 34px; height: 34px; border-radius: 50%; background: #f0ece5; font-size: 25px; line-height: 1; }
-.editor-photo { width: 100%; height: 170px; border-radius: 15px; object-fit: cover; background: #e9e3da; }
+.editor-photo { width: 100%; height: 240px; border-radius: 15px; object-fit: cover; background: #e9e3da; }
 .editor-fields { margin: 16px 0; }
 .last-worn-row { display: flex; justify-content: space-between; align-items: center; border-top: 1px solid var(--line); padding-top: 10px; color: var(--muted); font-size: 12px; }
 .last-worn-row strong { color: var(--ink); font-size: 12px; }
@@ -447,3 +451,72 @@ button { -webkit-tap-highlight-color: transparent; }
 .match-list label { flex: 1; min-width: 0; display: grid; gap: 4px; }
 .match-list small { color: var(--muted); font-size: 11px; }
 .match-list select { width: 100%; min-height: 38px; border: 1px solid #ddd6cd; border-radius: 10px; padding: 7px 9px; background: #fffdf9; color: var(--ink); font-size: 13px; }
+.locate-button { margin: 10px 0 2px; }
+
+/* The stacked outfit look: worn order down the middle, layers and extras beside. */
+.outfit-look { display: grid; grid-template-columns: minmax(0, 168px); justify-content: center; gap: 10px; margin: 4px auto 16px; }
+.outfit-look.has-side { grid-template-columns: minmax(0, 160px) minmax(0, 96px); align-items: start; }
+.look-main, .look-side { display: grid; gap: 8px; align-content: start; }
+.look-slot { margin: 0; position: relative; }
+.look-photo { display: block; width: 100%; border-radius: 16px; background: #ece8e1; }
+.look-slot figcaption { position: absolute; left: 8px; bottom: 8px; font-size: 11px; font-weight: 750; color: var(--ink); background: rgba(255,253,248,.88); padding: 3px 8px; border-radius: 999px; }
+.look-top .look-photo { aspect-ratio: 1 / 0.78; }
+.look-bottom .look-photo { aspect-ratio: 1 / 0.98; }
+.look-dress .look-photo { aspect-ratio: 3 / 4.2; }
+.look-shoes .look-photo { aspect-ratio: 2.1 / 1; }
+.look-side .look-photo { aspect-ratio: 3 / 4; }
+.look-photo.photo-placeholder span { font-size: 34px; }
+.look-compact { grid-template-columns: minmax(0, 150px); }
+.look-compact.has-side { grid-template-columns: minmax(0, 140px) minmax(0, 84px); }
+.look-skeleton .card-skeleton { height: 180px; }
+
+/* Today: summary of the answers, opening into the adjust panel. */
+.adjust-summary { width: 100%; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 8px; margin: 0 0 14px; border: 1px solid var(--line); border-radius: 14px; background: white; cursor: pointer; text-align: left; color: var(--ink); min-height: 48px; }
+.adjust-summary span { font-size: 12px; padding: 5px 10px; border-radius: 999px; background: var(--canvas); }
+.adjust-summary strong { margin-left: auto; font-size: 13px; padding: 0 6px; text-decoration: underline; text-underline-offset: 3px; }
+.adjust-panel { padding: 4px 0 6px; margin-bottom: 8px; border-bottom: 1px solid var(--line); }
+.adjust-panel .question-block { margin-bottom: 14px; }
+.chip-row { display: flex; flex-wrap: wrap; gap: 8px; }
+.chip-row .choice-button { min-height: 44px; padding: 7px 14px; }
+.pick-source { font-size: 12px; color: var(--muted); text-align: center; margin: -6px 0 14px; line-height: 1.45; }
+.build-own { display: block; margin: 14px auto 0; }
+
+/* Undo lives in the toast; the region ignores taps, the toast itself doesn't. */
+.toast { display: flex; align-items: center; gap: 12px; pointer-events: auto; font-size: 13px; line-height: 1.35; text-align: left; }
+.toast-undo { flex-shrink: 0; min-height: 36px; padding: 6px 12px; border: 0; border-radius: 9px; background: var(--lime); color: var(--ink); font-weight: 800; font-size: 13px; cursor: pointer; }
+
+/* ---- Icons (Lucide, plus two drawn to match). Sized by their container. ---- */
+.nav-icon svg, .header-action svg { width: 22px; height: 22px; }
+.add-card svg, .batch-add svg { width: 22px; height: 22px; }
+.sparkle svg { width: 18px; height: 18px; }
+.empty-illustration span svg { width: 1em; height: 1em; display: block; }
+.camera-orb svg { width: 28px; height: 28px; }
+.tip-card span svg, .explanation-card > span svg, .settings-icon svg { width: 18px; height: 18px; display: block; }
+.privacy-note span svg { width: 13px; height: 13px; margin-top: 2px; display: block; }
+.button-icon { display: inline-flex; vertical-align: middle; }
+.button-icon svg { width: 16px; height: 16px; }
+.inline-icon { width: 16px; height: 16px; vertical-align: -3px; flex-shrink: 0; }
+.close-button svg { width: 20px; height: 20px; }
+.icon-text-button svg { width: 18px; height: 18px; display: block; }
+.batch-remove svg { width: 14px; height: 14px; }
+.photo-check-strip > span:first-child svg { width: 22px; height: 22px; display: block; }
+.photo-check-pick > span svg { width: 30px; height: 30px; display: block; }
+.photo-placeholder .category-icon { width: 36%; max-width: 60px; height: auto; color: #a39a8e; }
+.close-button, .icon-text-button { display: inline-grid; place-items: center; }
+
+/* ---- Readability: nothing under 11px, and small grey text dark enough to read
+   (4.5:1 against the page). ---- */
+.eyebrow, .card-category, .crop-controls label, .batch-add small, .choice-button small,
+.outfit-piece > span, .provider-row-radio small, .range-setting div, .stats-summary span,
+.stats-list li small, .plan-day-label small { font-size: 11px; }
+.field-hint, .worn-badge, .crop-label, .journal-badge { font-size: 11px; }
+.nav-button { font-size: 11px; color: #6f6963; }
+.choice-button small, .range-setting div { color: var(--muted); }
+
+/* ---- Touch targets: 44px for anything tapped on its own. ---- */
+.close-button { width: 44px; height: 44px; }
+.icon-text-button { min-width: 44px; min-height: 44px; padding: 6px 8px; font-size: 13px; }
+.text-button { min-height: 44px; display: inline-flex; align-items: center; }
+.segment-button { min-height: 44px; }
+.filter-chip { min-height: 40px; }
+.batch-remove { width: 30px; height: 30px; }

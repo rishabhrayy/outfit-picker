@@ -12,7 +12,80 @@
 
 export const DEFAULT_CONTROLS = Object.freeze({ zoom: 1, x: 50, y: 50 });
 export const MIN_ZOOM = 1;
-export const MAX_ZOOM = 3;
+// Shoes in a full-length mirror photo take up about a sixth of its height.
+export const MAX_ZOOM = 6;
+
+/**
+ * Turns a detected garment's box into a stored crop. The box is the format
+ * Gemini is trained to give, [yMin, xMin, yMax, xMax] scaled to 0-1000, and
+ * is padded a little so the garment isn't cut off at its edges. Returns null
+ * for anything unusable (missing, inverted, tiny, or the whole photo), which
+ * leaves the item showing the full photo as before.
+ */
+export function cropFromBox(box, padding = 0.08) {
+  if (!Array.isArray(box) || box.length !== 4) return null;
+  const [yMin, xMin, yMax, xMax] = box.map(Number);
+  if (![yMin, xMin, yMax, xMax].every(Number.isFinite)) return null;
+  if (yMin >= yMax || xMin >= xMax) return null;
+
+  const scale = (value) => clamp(value / 10, 0, 100);
+  const top = scale(yMin);
+  const left = scale(xMin);
+  const height = scale(yMax) - top;
+  const width = scale(xMax) - left;
+  // Smaller than 3% either way is a stray mark, not a garment.
+  if (width < 3 || height < 3) return null;
+  // Practically the whole photo: nothing to crop to.
+  if (width > 92 && height > 92) return null;
+
+  const padX = width * padding;
+  const padY = height * padding;
+  const x = clamp(left - padX, 0, 100);
+  const y = clamp(top - padY, 0, 100);
+  return {
+    x,
+    y,
+    width: clamp(left + width + padX, 0, 100) - x,
+    height: clamp(top + height + padY, 0, 100) - y,
+    unit: 'percent',
+  };
+}
+
+/**
+ * Where to draw a photo so its crop fills a frame of any shape. The whole crop
+ * is kept in view (so tall trousers aren't cut off in a square frame), the
+ * frame is never left with empty space, and the crop is centred as far as the
+ * photo's edges allow. Returns pixel sizes and offsets for the image.
+ */
+export function coverLayout({ naturalWidth, naturalHeight, frameWidth, frameHeight, crop }) {
+  const nw = Number(naturalWidth);
+  const nh = Number(naturalHeight);
+  const fw = Number(frameWidth);
+  const fh = Number(frameHeight);
+  if (![nw, nh, fw, fh].every((value) => Number.isFinite(value) && value > 0)) return null;
+
+  const rect = crop && Number(crop.width) > 0 && Number(crop.height) > 0
+    ? crop
+    : { x: 0, y: 0, width: 100, height: 100 };
+  const boxWidth = (Number(rect.width) / 100) * nw;
+  const boxHeight = (Number(rect.height) / 100) * nh;
+
+  const fitBox = Math.min(fw / boxWidth, fh / boxHeight);
+  const coverFrame = Math.max(fw / nw, fh / nh);
+  const scale = Math.max(fitBox, coverFrame);
+
+  const width = nw * scale;
+  const height = nh * scale;
+  const centreX = ((Number(rect.x) + Number(rect.width) / 2) / 100) * nw * scale;
+  const centreY = ((Number(rect.y) + Number(rect.height) / 2) / 100) * nh * scale;
+
+  return {
+    width,
+    height,
+    left: clamp(fw / 2 - centreX, fw - width, 0),
+    top: clamp(fh / 2 - centreY, fh - height, 0),
+  };
+}
 
 function clamp(value, min, max) {
   const number = Number(value);
